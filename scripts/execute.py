@@ -10,8 +10,10 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -54,6 +56,11 @@ class StepExecutor:
     """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
 
     MAX_RETRIES = 3
+    EXEC_TIMEOUT = 1800
+    POST_STEP_GRACE = 2.0
+    TERMINATE_TIMEOUT = 5
+    CIRCUIT_BREAKER_THRESHOLD = 2
+    GUARDRail_DOCS = ("PRD.md", "ARCHITECTURE.md", "ADR.md", "RESULTS_POLICY.md")
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
     TZ = timezone(timedelta(hours=9))
@@ -83,6 +90,7 @@ class StepExecutor:
     def run(self):
         self._print_header()
         self._check_blockers()
+        self._check_clean_worktree()
         self._checkout_branch()
         guardrails = self._load_guardrails()
         self._ensure_created_at()
@@ -104,11 +112,48 @@ class StepExecutor:
     def _write_json(p: Path, data: dict):
         p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    def _step_status(self, step_num: int) -> str:
+        index = self._read_json(self._index_file)
+        return next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
+
     # --- git ---
 
     def _run_git(self, *args) -> subprocess.CompletedProcess:
         cmd = ["git"] + list(args)
         return subprocess.run(cmd, cwd=self._root, capture_output=True, text=True)
+
+    @staticmethod
+    def _parse_porcelain_path(line: str) -> str:
+        entry = line[3:] if len(line) > 3 else ""
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        return entry.strip()
+
+    def _run_hook(self, script_name: str, *args, env: Optional[dict] = None):
+        script_path = ROOT / "scripts" / "hooks" / script_name
+        if not script_path.exists():
+            return None
+        hook_env = {**os.environ, **env} if env else None
+        return subprocess.run(
+            [str(script_path), *args],
+            cwd=self._root,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=hook_env,
+        )
+
+    def _run_repo_checks(self):
+        script_path = ROOT / "scripts" / "codex_repo_checks.sh"
+        if not script_path.exists():
+            return None
+        return subprocess.run(
+            [str(script_path)],
+            cwd=self._root,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
 
     def _checkout_branch(self):
         branch = f"feat-{self._phase_name}"
@@ -132,6 +177,33 @@ class StepExecutor:
             sys.exit(1)
 
         print(f"  Branch: {branch}")
+
+    def _check_clean_worktree(self):
+        status = self._run_git("status", "--porcelain", "--untracked-files=all")
+        if status.returncode != 0:
+            print("  ERROR: git status 확인 실패.")
+            print(f"  {status.stderr.strip()}")
+            sys.exit(1)
+
+        allowed_prefix = f"phases/{self._phase_dir_name}/"
+        allowed_paths = {"phases/index.json"}
+        dirty_paths = []
+        for raw_line in status.stdout.splitlines():
+            path = self._parse_porcelain_path(raw_line)
+            if not path:
+                continue
+            if path in allowed_paths or path.startswith(allowed_prefix):
+                continue
+            dirty_paths.append(path)
+
+        if dirty_paths:
+            print("  ERROR: 현재 worktree에 phase 외 변경사항이 있어 자동 실행을 중단합니다.")
+            for path in dirty_paths[:10]:
+                print(f"  - {path}")
+            if len(dirty_paths) > 10:
+                print(f"  ... and {len(dirty_paths) - 10} more")
+            print("  Hint: 현재 phase 관련 파일만 남기고 나머지는 commit/stash 후 다시 실행하세요.")
+            sys.exit(1)
 
     def _commit_step(self, step_num: int, step_name: str):
         output_rel = f"phases/{self._phase_dir_name}/step{step_num}-output.json"
@@ -176,13 +248,28 @@ class StepExecutor:
 
     def _load_guardrails(self) -> str:
         sections = []
-        claude_md = ROOT / "CLAUDE.md"
-        if claude_md.exists():
-            sections.append(f"## 프로젝트 규칙 (CLAUDE.md)\n\n{claude_md.read_text()}")
+        agents_md = ROOT / "AGENTS.md"
+        missing_docs = []
+        if agents_md.exists():
+            sections.append(f"## 프로젝트 규칙 (AGENTS.md)\n\n{agents_md.read_text()}")
+        else:
+            missing_docs.append(str(agents_md))
         docs_dir = ROOT / "docs"
         if docs_dir.is_dir():
-            for doc in sorted(docs_dir.glob("*.md")):
+            for name in self.GUARDRail_DOCS:
+                doc = docs_dir / name
+                if not doc.exists():
+                    missing_docs.append(str(doc))
+                    continue
                 sections.append(f"## {doc.stem}\n\n{doc.read_text()}")
+        else:
+            missing_docs.extend(str(ROOT / "docs" / name) for name in self.GUARDRail_DOCS)
+
+        if missing_docs:
+            print("ERROR: required core docs are missing:")
+            for path in missing_docs:
+                print(f"  - {path}")
+            sys.exit(1)
         return "\n\n---\n\n".join(sections) if sections else ""
 
     @staticmethod
@@ -196,6 +283,56 @@ class StepExecutor:
             return ""
         return "## 이전 Step 산출물\n\n" + "\n".join(lines) + "\n\n"
 
+    @staticmethod
+    def _validate_results_contract(step: dict) -> Optional[str]:
+        contract = step.get("results_contract")
+        if not contract:
+            return None
+
+        required_keys = ("summary_path", "output_paths", "comparison_artifacts", "comparison_basis")
+        missing_keys = [key for key in required_keys if key not in contract]
+        if missing_keys:
+            return f"results_contract is missing required keys: {', '.join(missing_keys)}"
+
+        if not isinstance(contract["output_paths"], list) or not contract["output_paths"]:
+            return "results_contract.output_paths must be a non-empty list"
+        if not isinstance(contract["comparison_artifacts"], list) or not contract["comparison_artifacts"]:
+            return "results_contract.comparison_artifacts must be a non-empty list"
+
+        summary_path = ROOT / contract["summary_path"]
+        if not summary_path.is_file():
+            return f"results summary file not found: {contract['summary_path']}"
+
+        missing_outputs = [
+            path for path in contract["output_paths"]
+            if not (ROOT / path).exists()
+        ]
+        if missing_outputs:
+            return f"results output not found: {missing_outputs[0]}"
+
+        missing_comparisons = [
+            path for path in contract["comparison_artifacts"]
+            if not (ROOT / path).exists()
+        ]
+        if missing_comparisons:
+            return f"comparison artifact not found: {missing_comparisons[0]}"
+
+        summary_text = summary_path.read_text(encoding="utf-8")
+        required_markers = ("실행 명령", "출력 위치", "비교 기준", "핵심 결과")
+        missing_markers = [marker for marker in required_markers if marker not in summary_text]
+        if missing_markers:
+            return f"results summary is missing required sections: {', '.join(missing_markers)}"
+
+        basis_text = str(contract["comparison_basis"]).strip()
+        if not basis_text:
+            return "results_contract.comparison_basis must not be empty"
+
+        summary_basis = re.search(r"비교 기준:\s*(.+)", summary_text)
+        if not summary_basis or basis_text not in summary_basis.group(1):
+            return "results summary does not record the declared comparison basis"
+
+        return None
+
     def _build_preamble(self, guardrails: str, step_context: str,
                         prev_error: Optional[str] = None) -> str:
         commit_example = self.FEAT_MSG.format(
@@ -208,7 +345,7 @@ class StepExecutor:
                 f"{prev_error}\n\n---\n\n"
             )
         return (
-            f"당신은 {self._project} 프로젝트의 개발자입니다. 아래 step을 수행하세요.\n\n"
+            f"당신은 Codex이며 {self._project} 프로젝트의 개발자입니다. 아래 step을 수행하세요.\n\n"
             f"{guardrails}\n\n---\n\n"
             f"{step_context}{retry_section}"
             f"## 작업 규칙\n\n"
@@ -216,17 +353,27 @@ class StepExecutor:
             f"2. 이 step에 명시된 작업만 수행하라. 추가 기능이나 파일을 만들지 마라.\n"
             f"3. 기존 테스트를 깨뜨리지 마라.\n"
             f"4. AC(Acceptance Criteria) 검증을 직접 실행하라.\n"
-            f"5. /phases/{self._phase_dir_name}/index.json의 해당 step status를 업데이트하라:\n"
+            f"5. 위험한 파괴적 명령이나 복구 불가능한 명령은 사용하지 마라.\n"
+            f"6. target-project validation이 포함된 step은 `docs/RESULTS_POLICY.md`에 맞는 결과 산출물과 요약을 남기기 전에는 완료로 표시하지 마라.\n"
+            f"7. 검증 결과와 최종 상태를 반영해 /phases/{self._phase_dir_name}/index.json을 직접 수정하라:\n"
             f"   - AC 통과 → \"completed\" + \"summary\" 필드에 이 step의 산출물을 한 줄로 요약\n"
             f"   - {self.MAX_RETRIES}회 수정 시도 후에도 실패 → \"error\" + \"error_message\" 기록\n"
             f"   - 사용자 개입이 필요한 경우 (API 키, 인증, 수동 설정 등) → \"blocked\" + \"blocked_reason\" 기록 후 즉시 중단\n"
-            f"6. 모든 변경사항을 커밋하라:\n"
+            f"8. 모든 변경사항을 커밋하라:\n"
             f"   {commit_example}\n\n---\n\n"
         )
 
-    # --- Claude 호출 ---
+    def _validate_prompt_safety(self, prompt: str):
+        result = self._run_hook("dangerous-cmd-guard.sh", prompt)
+        if result and result.returncode != 0:
+            print("  ERROR: dangerous command pattern found in step prompt.")
+            if result.stderr:
+                print(f"  {result.stderr.strip()}")
+            sys.exit(1)
 
-    def _invoke_claude(self, step: dict, preamble: str) -> dict:
+    # --- Codex 호출 ---
+
+    def _invoke_codex(self, step: dict, preamble: str) -> dict:
         step_num, step_name = step["step"], step["name"]
         step_file = self._phase_dir / f"step{step_num}.md"
 
@@ -235,24 +382,124 @@ class StepExecutor:
             sys.exit(1)
 
         prompt = preamble + step_file.read_text()
-        result = subprocess.run(
-            ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
-            cwd=self._root, capture_output=True, text=True, timeout=1800,
-        )
+        self._validate_prompt_safety(prompt)
+        stdout_fd, stdout_raw = tempfile.mkstemp(suffix=".stdout", dir=self._phase_dir)
+        stderr_fd, stderr_raw = tempfile.mkstemp(suffix=".stderr", dir=self._phase_dir)
+        os.close(stdout_fd)
+        os.close(stderr_fd)
+        stdout_path = Path(stdout_raw)
+        stderr_path = Path(stderr_raw)
+        with tempfile.NamedTemporaryFile(
+            mode="w+",
+            encoding="utf-8",
+            suffix=".txt",
+            dir=self._phase_dir,
+            delete=False,
+        ) as last_message_file:
+            last_message_path = Path(last_message_file.name)
 
-        if result.returncode != 0:
-            print(f"\n  WARN: Claude가 비정상 종료됨 (code {result.returncode})")
-            if result.stderr:
-                print(f"  stderr: {result.stderr[:500]}")
+        cmd = [
+            "codex",
+            "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-C",
+            self._root,
+            "-o",
+            str(last_message_path),
+            prompt,
+        ]
+
+        proc = None
+        forced_stop = False
+        completed_with_timeout = False
+        stdout = ""
+        stderr = ""
+        try:
+            with open(stdout_path, "w", encoding="utf-8") as stdout_file, open(stderr_path, "w", encoding="utf-8") as stderr_file:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=self._root,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    text=True,
+                )
+
+                settled_at = None
+                deadline = time.monotonic() + self.EXEC_TIMEOUT
+
+                while True:
+                    ret = proc.poll()
+                    status = self._step_status(step_num)
+
+                    if ret is not None:
+                        exit_code = ret
+                        break
+
+                    if status in {"completed", "error", "blocked"}:
+                        if settled_at is None:
+                            settled_at = time.monotonic()
+                        elif time.monotonic() - settled_at >= self.POST_STEP_GRACE:
+                            forced_stop = True
+                            proc.terminate()
+                            try:
+                                proc.communicate(timeout=self.TERMINATE_TIMEOUT)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                                proc.communicate()
+                            exit_code = proc.returncode if proc.returncode is not None else 0
+                            break
+                    else:
+                        settled_at = None
+
+                    if time.monotonic() >= deadline:
+                        if status in {"completed", "error", "blocked"}:
+                            completed_with_timeout = True
+                            forced_stop = True
+                            proc.kill()
+                            proc.communicate()
+                            exit_code = proc.returncode if proc.returncode is not None else 0
+                            break
+                        proc.kill()
+                        proc.communicate()
+                        raise subprocess.TimeoutExpired(cmd=cmd, timeout=self.EXEC_TIMEOUT)
+
+                    time.sleep(0.2)
+
+            stdout = stdout_path.read_text(encoding="utf-8") if stdout_path.exists() else ""
+            stderr = stderr_path.read_text(encoding="utf-8") if stderr_path.exists() else ""
+            last_message = last_message_path.read_text(encoding="utf-8") if last_message_path.exists() else ""
+        except subprocess.TimeoutExpired:
+            print(f"\n  WARN: Codex 실행이 {self.EXEC_TIMEOUT}초를 초과했습니다.")
+            raise
+        finally:
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            last_message_path.unlink(missing_ok=True)
+            stdout_path.unlink(missing_ok=True)
+            stderr_path.unlink(missing_ok=True)
+
+        if exit_code != 0 and self._step_status(step_num) == "pending":
+            print(f"\n  WARN: Codex가 비정상 종료됨 (code {exit_code})")
+            if stderr:
+                print(f"  stderr: {stderr[:500]}")
+        elif forced_stop and completed_with_timeout:
+            stderr = (stderr or "") + "\n[executor] step status finalized before Codex process exited; process was killed at timeout."
+        elif forced_stop:
+            stderr = (stderr or "") + "\n[executor] step status finalized before Codex process exited; process was terminated by executor."
 
         output = {
-            "step": step_num, "name": step_name,
-            "exitCode": result.returncode,
-            "stdout": result.stdout, "stderr": result.stderr,
+            "step": step_num,
+            "name": step_name,
+            "exitCode": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "lastMessage": last_message,
+            "forcedStop": forced_stop,
         }
         out_path = self._phase_dir / f"step{step_num}-output.json"
-        with open(out_path, "w") as f:
-            json.dump(output, f, indent=2, ensure_ascii=False)
+        self._write_json(out_path, output)
 
         return output
 
@@ -306,14 +553,42 @@ class StepExecutor:
                 tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
 
             with progress_indicator(tag) as pi:
-                self._invoke_claude(step, preamble)
+                self._invoke_codex(step, preamble)
                 elapsed = int(pi.elapsed)
 
             index = self._read_json(self._index_file)
             status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
+            step_entry = next((s for s in index["steps"] if s["step"] == step_num), None)
             ts = self._stamp()
 
             if status == "completed":
+                contract_error = self._validate_results_contract(step_entry or step)
+                if contract_error:
+                    for s in index["steps"]:
+                        if s["step"] == step_num:
+                            s["status"] = "error"
+                            s["error_message"] = f"[results-contract] {contract_error}"
+                            s["failed_at"] = ts
+                    self._write_json(self._index_file, index)
+                    self._commit_step(step_num, step_name)
+                    print(f"  ✗ Step {step_num}: results contract failed [{elapsed}s]")
+                    print(f"    Error: {contract_error}")
+                    self._update_top_index("error")
+                    sys.exit(1)
+                repo_checks = self._run_repo_checks()
+                if repo_checks and repo_checks.returncode != 0:
+                    repo_msg = (repo_checks.stderr or repo_checks.stdout or "repo checks failed").strip()
+                    for s in index["steps"]:
+                        if s["step"] == step_num:
+                            s["status"] = "error"
+                            s["error_message"] = f"[repo-checks] {repo_msg}"
+                            s["failed_at"] = ts
+                    self._write_json(self._index_file, index)
+                    self._commit_step(step_num, step_name)
+                    print(f"  ✗ Step {step_num}: repo checks failed [{elapsed}s]")
+                    print(f"    Error: {repo_msg}")
+                    self._update_top_index("error")
+                    sys.exit(1)
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["completed_at"] = ts
@@ -339,6 +614,23 @@ class StepExecutor:
             )
 
             if attempt < self.MAX_RETRIES:
+                hook_result = self._run_hook(
+                    "circuit-breaker.sh",
+                    err_msg,
+                    env={"CIRCUIT_BREAKER_THRESHOLD": str(self.CIRCUIT_BREAKER_THRESHOLD)},
+                )
+                if hook_result and hook_result.returncode == 2:
+                    breaker_msg = hook_result.stderr.strip()
+                    for s in index["steps"]:
+                        if s["step"] == step_num:
+                            s["status"] = "error"
+                            s["error_message"] = f"[circuit-breaker] {breaker_msg}"
+                            s["failed_at"] = ts
+                    self._write_json(self._index_file, index)
+                    self._commit_step(step_num, step_name)
+                    print(f"  ⚠ Circuit breaker: {breaker_msg}")
+                    self._update_top_index("error")
+                    sys.exit(1)
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["status"] = "pending"

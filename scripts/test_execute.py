@@ -4,11 +4,9 @@ execute.py 리팩터링 안전망 테스트.
 """
 
 import json
-import os
 import subprocess
 import sys
-import textwrap
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -24,15 +22,19 @@ import execute as ex
 
 @pytest.fixture
 def tmp_project(tmp_path):
-    """phases/, CLAUDE.md, docs/ 를 갖춘 임시 프로젝트 구조."""
+    """phases/, AGENTS.md, docs/ 를 갖춘 임시 프로젝트 구조."""
     phases_dir = tmp_path / "phases"
     phases_dir.mkdir()
 
-    claude_md = tmp_path / "CLAUDE.md"
-    claude_md.write_text("# Rules\n- rule one\n- rule two")
+    agents_md = tmp_path / "AGENTS.md"
+    agents_md.write_text("# Rules\n- rule one\n- rule two")
 
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir()
+    (docs_dir / "PRD.md").write_text("# PRD\nProduct content")
+    (docs_dir / "ARCHITECTURE.md").write_text("# Architecture\nSome content")
+    (docs_dir / "ADR.md").write_text("# ADR\nDecision log")
+    (docs_dir / "RESULTS_POLICY.md").write_text("# Results Policy\nResult content")
     (docs_dir / "arch.md").write_text("# Architecture\nSome content")
     (docs_dir / "guide.md").write_text("# Guide\nAnother doc")
 
@@ -146,40 +148,48 @@ class TestJsonHelpers:
 # ---------------------------------------------------------------------------
 
 class TestLoadGuardrails:
-    def test_loads_claude_md_and_docs(self, executor, tmp_project):
+    def test_loads_agents_md_and_docs(self, executor, tmp_project):
         with patch.object(ex, "ROOT", tmp_project):
             result = executor._load_guardrails()
         assert "# Rules" in result
         assert "rule one" in result
+        assert "# PRD" in result
         assert "# Architecture" in result
-        assert "# Guide" in result
+        assert "# ADR" in result
+        assert "# Results Policy" in result
 
     def test_sections_separated_by_divider(self, executor, tmp_project):
         with patch.object(ex, "ROOT", tmp_project):
             result = executor._load_guardrails()
         assert "---" in result
 
-    def test_docs_sorted_alphabetically(self, executor, tmp_project):
+    def test_loads_only_core_docs(self, executor, tmp_project):
         with patch.object(ex, "ROOT", tmp_project):
             result = executor._load_guardrails()
-        arch_pos = result.index("arch")
-        guide_pos = result.index("guide")
-        assert arch_pos < guide_pos
+        assert "guide" not in result
+        assert "arch\n\n# Architecture" not in result
 
-    def test_no_claude_md(self, executor, tmp_project):
-        (tmp_project / "CLAUDE.md").unlink()
+    def test_no_agents_md(self, executor, tmp_project):
+        (tmp_project / "AGENTS.md").unlink()
         with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
-        assert "CLAUDE.md" not in result
-        assert "Architecture" in result
+            with pytest.raises(SystemExit) as exc_info:
+                executor._load_guardrails()
+        assert exc_info.value.code == 1
 
     def test_no_docs_dir(self, executor, tmp_project):
         import shutil
         shutil.rmtree(tmp_project / "docs")
         with patch.object(ex, "ROOT", tmp_project):
-            result = executor._load_guardrails()
-        assert "Rules" in result
-        assert "Architecture" not in result
+            with pytest.raises(SystemExit) as exc_info:
+                executor._load_guardrails()
+        assert exc_info.value.code == 1
+
+    def test_missing_core_doc_exits(self, executor, tmp_project):
+        (tmp_project / "docs" / "RESULTS_POLICY.md").unlink()
+        with patch.object(ex, "ROOT", tmp_project):
+            with pytest.raises(SystemExit) as exc_info:
+                executor._load_guardrails()
+        assert exc_info.value.code == 1
 
     def test_empty_project(self, tmp_path):
         with patch.object(ex, "ROOT", tmp_path):
@@ -189,8 +199,9 @@ class TestLoadGuardrails:
             idx = {"project": "T", "phase": "t", "steps": []}
             (phases_dir / "index.json").write_text(json.dumps(idx))
             inst = ex.StepExecutor.__new__(ex.StepExecutor)
-            result = inst._load_guardrails()
-        assert result == ""
+            with pytest.raises(SystemExit) as exc_info:
+                inst._load_guardrails()
+        assert exc_info.value.code == 1
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +264,7 @@ class TestBuildPreamble:
         result = executor._build_preamble("", "")
         assert "작업 규칙" in result
         assert "AC" in result
+        assert "rm -rf" not in result
 
     def test_no_retry_section_by_default(self, executor):
         result = executor._build_preamble("", "")
@@ -379,6 +391,30 @@ class TestCheckoutBranch:
 
 
 # ---------------------------------------------------------------------------
+# _check_clean_worktree
+# ---------------------------------------------------------------------------
+
+class TestCheckCleanWorktree:
+    def test_allows_only_current_phase_changes(self, executor):
+        executor._run_git = lambda *args: MagicMock(
+            returncode=0,
+            stdout="?? phases/index.json\n?? phases/0-mvp/index.json\n?? phases/0-mvp/step2.md\n",
+            stderr="",
+        )
+        executor._check_clean_worktree()
+
+    def test_rejects_unrelated_dirty_paths(self, executor):
+        executor._run_git = lambda *args: MagicMock(
+            returncode=0,
+            stdout="?? phases/0-mvp/index.json\n M docs/PRD.md\n?? scratch.txt\n",
+            stderr="",
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            executor._check_clean_worktree()
+        assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
 # _commit_step (mocked)
 # ---------------------------------------------------------------------------
 
@@ -420,32 +456,69 @@ class TestCommitStep:
 
 
 # ---------------------------------------------------------------------------
-# _invoke_claude (mocked)
+# _invoke_codex (mocked)
 # ---------------------------------------------------------------------------
 
-class TestInvokeClaude:
-    def test_invokes_claude_with_correct_args(self, executor):
-        mock_result = MagicMock(returncode=0, stdout='{"result": "ok"}', stderr="")
+class TestInvokeCodex:
+    class FakePopen:
+        def __init__(self, *, returncode=0, stdout="", stderr="", poll_values=None, on_poll=None):
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+            self._poll_values = list(poll_values or [returncode])
+            self._on_poll = on_poll
+            self.terminate_called = False
+            self.kill_called = False
+
+        def poll(self):
+            if self._on_poll:
+                self._on_poll()
+                self._on_poll = None
+            if len(self._poll_values) > 1:
+                return self._poll_values.pop(0)
+            return self._poll_values[0]
+
+        def communicate(self, timeout=None):
+            return self._stdout, self._stderr
+
+        def terminate(self):
+            self.terminate_called = True
+            self._poll_values = [self.returncode]
+
+        def kill(self):
+            self.kill_called = True
+            self._poll_values = [self.returncode]
+
+    def test_invokes_codex_with_correct_args(self, executor):
+        fake_proc = self.FakePopen(returncode=0, stdout='{"result": "ok"}', stderr="")
         step = {"step": 2, "name": "ui"}
         preamble = "PREAMBLE\n"
 
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
-            output = executor._invoke_claude(step, preamble)
+        with patch.object(ex.StepExecutor, "_validate_prompt_safety", return_value=None):
+            with patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
+                output = executor._invoke_codex(step, preamble)
 
-        cmd = mock_run.call_args[0][0]
-        assert cmd[0] == "claude"
-        assert "-p" in cmd
-        assert "--dangerously-skip-permissions" in cmd
-        assert "--output-format" in cmd
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[0] == "codex"
+        assert cmd[1] == "exec"
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+        assert "-o" in cmd
+        assert "-C" in cmd
         assert "PREAMBLE" in cmd[-1]
         assert "UI를 구현하세요" in cmd[-1]
+        assert output["lastMessage"] == ""
+        assert output["forcedStop"] is False
+        assert mock_popen.call_args[1]["stdin"] == ex.subprocess.DEVNULL
+        assert mock_popen.call_args[1]["stdout"] is not ex.subprocess.PIPE
+        assert mock_popen.call_args[1]["stderr"] is not ex.subprocess.PIPE
 
     def test_saves_output_json(self, executor):
-        mock_result = MagicMock(returncode=0, stdout='{"ok": true}', stderr="")
+        fake_proc = self.FakePopen(returncode=0, stdout='{"ok": true}', stderr="")
         step = {"step": 2, "name": "ui"}
 
-        with patch("subprocess.run", return_value=mock_result):
-            executor._invoke_claude(step, "preamble")
+        with patch.object(ex.StepExecutor, "_validate_prompt_safety", return_value=None):
+            with patch("subprocess.Popen", return_value=fake_proc):
+                executor._invoke_codex(step, "preamble")
 
         output_file = executor._phase_dir / "step2-output.json"
         assert output_file.exists()
@@ -453,21 +526,103 @@ class TestInvokeClaude:
         assert data["step"] == 2
         assert data["name"] == "ui"
         assert data["exitCode"] == 0
+        assert "lastMessage" in data
 
     def test_nonexistent_step_file_exits(self, executor):
         step = {"step": 99, "name": "nonexistent"}
         with pytest.raises(SystemExit) as exc_info:
-            executor._invoke_claude(step, "preamble")
+            executor._invoke_codex(step, "preamble")
         assert exc_info.value.code == 1
 
     def test_timeout_is_1800(self, executor):
-        mock_result = MagicMock(returncode=0, stdout="{}", stderr="")
+        fake_proc = self.FakePopen(returncode=0, stdout="{}", stderr="")
         step = {"step": 2, "name": "ui"}
 
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
-            executor._invoke_claude(step, "preamble")
+        with patch.object(ex.StepExecutor, "_validate_prompt_safety", return_value=None):
+            with patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
+                executor._invoke_codex(step, "preamble")
 
-        assert mock_run.call_args[1]["timeout"] == 1800
+        assert "timeout" not in mock_popen.call_args[1]
+
+    def test_reads_last_message_file(self, executor):
+        step = {"step": 2, "name": "ui"}
+        out_path = executor._phase_dir / "tmp-last-message.txt"
+
+        def on_poll():
+            out_path.write_text("final codex response", encoding="utf-8")
+
+        fake_proc = self.FakePopen(returncode=0, stdout="", stderr="", on_poll=on_poll)
+
+        def fake_named_tempfile(*args, **kwargs):
+            class TempFile:
+                name = str(out_path)
+                def __enter__(self_inner):
+                    out_path.write_text("", encoding="utf-8")
+                    return self_inner
+                def __exit__(self_inner, exc_type, exc, tb):
+                    return False
+            return TempFile()
+
+        with patch.object(ex.StepExecutor, "_validate_prompt_safety", return_value=None):
+            with patch("tempfile.NamedTemporaryFile", side_effect=fake_named_tempfile):
+                with patch("subprocess.Popen", return_value=fake_proc):
+                    output = executor._invoke_codex(step, "preamble")
+
+        assert output["lastMessage"] == "final codex response"
+
+    def test_forces_stop_after_status_finalized(self, executor):
+        step = {"step": 2, "name": "ui"}
+        index = executor._read_json(executor._index_file)
+
+        def mark_completed():
+            for item in index["steps"]:
+                if item["step"] == 2:
+                    item["status"] = "completed"
+                    item["summary"] = "done"
+            executor._write_json(executor._index_file, index)
+
+        fake_proc = self.FakePopen(
+            returncode=0,
+            stdout="ok",
+            stderr="",
+            poll_values=[None, None, None, 0],
+            on_poll=mark_completed,
+        )
+
+        with patch.object(ex.StepExecutor, "_validate_prompt_safety", return_value=None):
+            with patch.object(ex.StepExecutor, "POST_STEP_GRACE", 0):
+                with patch("subprocess.Popen", return_value=fake_proc):
+                    output = executor._invoke_codex(step, "preamble")
+
+        assert output["forcedStop"] is True
+        assert fake_proc.terminate_called is True
+
+    def test_timeout_raises_when_status_still_pending(self, executor):
+        step = {"step": 2, "name": "ui"}
+        fake_proc = self.FakePopen(returncode=1, stdout="", stderr="", poll_values=[None, None, None])
+
+        with patch.object(ex.StepExecutor, "_validate_prompt_safety", return_value=None):
+            with patch.object(ex.StepExecutor, "EXEC_TIMEOUT", 0):
+                with patch("subprocess.Popen", return_value=fake_proc):
+                    with pytest.raises(subprocess.TimeoutExpired):
+                        executor._invoke_codex(step, "preamble")
+
+        assert fake_proc.kill_called is True
+
+    def test_exits_when_dangerous_prompt_is_detected(self, executor):
+        step = {"step": 2, "name": "ui"}
+
+        def fake_run_hook(script_name, *args):
+            if script_name == "dangerous-cmd-guard.sh":
+                return MagicMock(returncode=1, stderr="BLOCKED: dangerous command pattern detected.")
+            return None
+
+        executor._run_hook = fake_run_hook
+
+        with pytest.raises(SystemExit) as exc_info:
+            executor._invoke_codex(step, "rm -rf /tmp\n")
+
+        assert exc_info.value.code == 1
 
 
 # ---------------------------------------------------------------------------
@@ -557,3 +712,206 @@ class TestCheckBlockers:
         with pytest.raises(SystemExit) as exc_info:
             inst._check_blockers()
         assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# _execute_single_step circuit breaker integration
+# ---------------------------------------------------------------------------
+
+class TestExecuteSingleStep:
+    def test_uses_lower_circuit_breaker_threshold(self, executor):
+        calls = []
+
+        def fake_invoke(step, preamble):
+            index = executor._read_json(executor._index_file)
+            for item in index["steps"]:
+                if item["step"] == step["step"]:
+                    item["status"] = "error"
+                    item["error_message"] = "same failure"
+            executor._write_json(executor._index_file, index)
+
+        def fake_run_hook(script_name, *args, env=None):
+            calls.append((script_name, args, env))
+            return MagicMock(returncode=0, stderr="")
+
+        executor._invoke_codex = fake_invoke
+        executor._run_hook = fake_run_hook
+
+        with patch.object(ex, "progress_indicator") as mock_progress:
+            cm = MagicMock()
+            cm.__enter__.return_value = MagicMock(elapsed=0)
+            cm.__exit__.return_value = False
+            mock_progress.return_value = cm
+            with pytest.raises(SystemExit) as exc_info:
+                executor._execute_single_step({"step": 2, "name": "ui"}, "guards")
+
+        assert exc_info.value.code == 1
+        cb_call = next(call for call in calls if call[0] == "circuit-breaker.sh")
+        assert cb_call[2]["CIRCUIT_BREAKER_THRESHOLD"] == str(ex.StepExecutor.CIRCUIT_BREAKER_THRESHOLD)
+
+    def test_circuit_breaker_stops_retry_and_marks_error(self, executor):
+        def fake_invoke(step, preamble):
+            index = executor._read_json(executor._index_file)
+            for item in index["steps"]:
+                if item["step"] == step["step"]:
+                    item["status"] = "error"
+                    item["error_message"] = "same failure"
+            executor._write_json(executor._index_file, index)
+
+        executor._invoke_codex = fake_invoke
+        executor._run_hook = lambda script_name, *args, env=None: MagicMock(
+            returncode=2 if script_name == "circuit-breaker.sh" else 0,
+            stderr="CIRCUIT BREAKER: same error repeated",
+        )
+        executor._commit_step = lambda *args: None
+        executor._update_top_index = lambda *args: None
+
+        with patch.object(ex, "progress_indicator") as mock_progress:
+            cm = MagicMock()
+            cm.__enter__.return_value = MagicMock(elapsed=0)
+            cm.__exit__.return_value = False
+            mock_progress.return_value = cm
+            with pytest.raises(SystemExit) as exc_info:
+                executor._execute_single_step({"step": 2, "name": "ui"}, "guards")
+
+        assert exc_info.value.code == 1
+        index = executor._read_json(executor._index_file)
+        step = next(item for item in index["steps"] if item["step"] == 2)
+        assert step["status"] == "error"
+        assert "[circuit-breaker]" in step["error_message"]
+
+    def test_completed_step_runs_repo_checks(self, executor):
+        calls = []
+
+        def fake_invoke(step, preamble):
+            index = executor._read_json(executor._index_file)
+            for item in index["steps"]:
+                if item["step"] == step["step"]:
+                    item["status"] = "completed"
+                    item["summary"] = "done"
+            executor._write_json(executor._index_file, index)
+
+        executor._invoke_codex = fake_invoke
+        executor._run_repo_checks = lambda: calls.append("repo-checks") or MagicMock(returncode=0, stderr="")
+        executor._commit_step = lambda *args: None
+
+        with patch.object(ex, "progress_indicator") as mock_progress:
+            cm = MagicMock()
+            cm.__enter__.return_value = MagicMock(elapsed=0)
+            cm.__exit__.return_value = False
+            mock_progress.return_value = cm
+            assert executor._execute_single_step({"step": 2, "name": "ui"}, "guards") is True
+
+        assert calls == ["repo-checks"]
+
+    def test_repo_checks_failure_marks_step_error(self, executor):
+        def fake_invoke(step, preamble):
+            index = executor._read_json(executor._index_file)
+            for item in index["steps"]:
+                if item["step"] == step["step"]:
+                    item["status"] = "completed"
+                    item["summary"] = "done"
+            executor._write_json(executor._index_file, index)
+
+        executor._invoke_codex = fake_invoke
+        executor._run_repo_checks = lambda: MagicMock(returncode=1, stderr="repo checks failed")
+        executor._commit_step = lambda *args: None
+        executor._update_top_index = lambda *args: None
+
+        with patch.object(ex, "progress_indicator") as mock_progress:
+            cm = MagicMock()
+            cm.__enter__.return_value = MagicMock(elapsed=0)
+            cm.__exit__.return_value = False
+            mock_progress.return_value = cm
+            with pytest.raises(SystemExit) as exc_info:
+                executor._execute_single_step({"step": 2, "name": "ui"}, "guards")
+
+        assert exc_info.value.code == 1
+        index = executor._read_json(executor._index_file)
+        step = next(item for item in index["steps"] if item["step"] == 2)
+        assert step["status"] == "error"
+        assert "[repo-checks]" in step["error_message"]
+
+    def test_results_contract_failure_marks_step_error(self, executor):
+        with patch.object(ex, "ROOT", Path(executor._root)):
+            index = executor._read_json(executor._index_file)
+            for item in index["steps"]:
+                if item["step"] == 2:
+                    item["results_contract"] = {
+                        "summary_path": "results/case/summary.md",
+                        "output_paths": ["results/case/run.log"],
+                        "comparison_artifacts": ["results/case/comparison.md"],
+                        "comparison_basis": "baseline",
+                    }
+            executor._write_json(executor._index_file, index)
+
+            def fake_invoke(step, preamble):
+                index = executor._read_json(executor._index_file)
+                for item in index["steps"]:
+                    if item["step"] == step["step"]:
+                        item["status"] = "completed"
+                        item["summary"] = "done"
+                executor._write_json(executor._index_file, index)
+
+            executor._invoke_codex = fake_invoke
+            executor._commit_step = lambda *args: None
+            executor._update_top_index = lambda *args: None
+
+            with patch.object(ex, "progress_indicator") as mock_progress:
+                cm = MagicMock()
+                cm.__enter__.return_value = MagicMock(elapsed=0)
+                cm.__exit__.return_value = False
+                mock_progress.return_value = cm
+                with pytest.raises(SystemExit) as exc_info:
+                    executor._execute_single_step({"step": 2, "name": "ui"}, "guards")
+
+            assert exc_info.value.code == 1
+            index = executor._read_json(executor._index_file)
+            step = next(item for item in index["steps"] if item["step"] == 2)
+            assert step["status"] == "error"
+            assert "[results-contract]" in step["error_message"]
+
+    def test_results_contract_success_allows_completion(self, executor):
+        with patch.object(ex, "ROOT", Path(executor._root)):
+            results_dir = executor._phase_dir.parent.parent / "results" / "case"
+            results_dir.mkdir(parents=True)
+            (results_dir / "run.log").write_text("ok", encoding="utf-8")
+            (results_dir / "comparison.md").write_text("metric diff", encoding="utf-8")
+            (results_dir / "summary.md").write_text(
+                "## 실험명\n"
+                "- 실행 명령: ctest --test-dir build --output-on-failure\n"
+                "- 출력 위치: results/case\n"
+                "- 비교 기준: baseline\n"
+                "- 핵심 결과: passed\n",
+                encoding="utf-8",
+            )
+
+            index = executor._read_json(executor._index_file)
+            for item in index["steps"]:
+                if item["step"] == 2:
+                    item["results_contract"] = {
+                        "summary_path": "results/case/summary.md",
+                        "output_paths": ["results/case/run.log"],
+                        "comparison_artifacts": ["results/case/comparison.md"],
+                        "comparison_basis": "baseline",
+                    }
+            executor._write_json(executor._index_file, index)
+
+            def fake_invoke(step, preamble):
+                index = executor._read_json(executor._index_file)
+                for item in index["steps"]:
+                    if item["step"] == step["step"]:
+                        item["status"] = "completed"
+                        item["summary"] = "done"
+                executor._write_json(executor._index_file, index)
+
+            executor._invoke_codex = fake_invoke
+            executor._run_repo_checks = lambda: MagicMock(returncode=0, stderr="")
+            executor._commit_step = lambda *args: None
+
+            with patch.object(ex, "progress_indicator") as mock_progress:
+                cm = MagicMock()
+                cm.__enter__.return_value = MagicMock(elapsed=0)
+                cm.__exit__.return_value = False
+                mock_progress.return_value = cm
+                assert executor._execute_single_step({"step": 2, "name": "ui"}, "guards") is True

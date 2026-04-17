@@ -15,6 +15,7 @@ Codex에서 현재 확인된 설정 계층은 다음 두 가지다.
 - 레포 로컬 스킬:
   - `/.codex/skills/harness/SKILL.md`
   - `/.codex/skills/review/SKILL.md`
+  - `/.codex/skills/pdf/SKILL.md`
 - Codex 실행 진입점: `/scripts/codex_run.sh`
 - 레포 검증 스크립트: `/scripts/codex_repo_checks.sh`
 - 레포 로컬 guard scripts:
@@ -54,10 +55,10 @@ Codex에서 현재 확인된 설정 계층은 다음 두 가지다.
 
 1. Layer 1: `/docs/PRD.md`, `/docs/ARCHITECTURE.md`, `/docs/ADR.md`, `/docs/RESULTS_POLICY.md`를 먼저 채워 프로젝트 의도를 명확히 한다.
 2. Layer 2: `/AGENTS.md`에서 Codex의 실행 규칙을 정의한다.
-3. Layer 3: `harness` workflow로 사용자와 논의해 계획을 구체화하고, 이를 phase로 쪼갠 뒤 `scripts/execute.py`로 순차 자동 실행한다.
+3. Layer 3: `harness` workflow로 사용자와 논의해 계획을 구체화하고, 이를 ordered step으로 쪼갠 뒤 `scripts/execute.py`로 순차 자동 실행한다.
 4. Layer 4: hooks / repo checks가 자동 검증과 안전 장치를 담당한다.
 
-즉 `harness` workflow의 목표는 “phase 파일만 생성”이 아니라 “논의 → phase 설계 → execute.py 실행 → hook 기반 자동 검증”까지 이어지는 것이다.
+즉 `harness` workflow의 목표는 “step 파일만 생성”이 아니라 “논의 → step 설계 → execute.py 실행 → hook 기반 자동 검증”까지 이어지는 것이다.
 
 ## 전역 Codex 설정 예시
 
@@ -77,12 +78,18 @@ trust_level = "trusted"
 
 ## 운영 원칙
 
-- 위험 명령 차단은 `/scripts/hooks/dangerous-cmd-guard.sh`로 대체한다.
+- 위험 명령 차단은 `/scripts/hooks/dangerous-cmd-guard.sh`로 대체하며, 이 hook는 실제 실행 대상 command string을 검사한다.
 - 하네스 step 실행 시 안전 규칙은 `scripts/execute.py` 프롬프트에 직접 주입된다.
 - step 프롬프트에는 `/docs/PRD.md`, `/docs/ARCHITECTURE.md`, `/docs/ADR.md`, `/docs/RESULTS_POLICY.md`를 핵심 guardrail 문서로 주입한다.
-- target-project validation이 필요한 step은 `phases/<task>/index.json`에 `results_contract`를 선언해야 하며, `scripts/execute.py`는 완료 직전 해당 산출물과 요약 파일 필수 항목을 검증한다.
+- 모든 step은 `type`을 가져야 하며 허용값은 `reference`, `implementation`, `validation`이다.
+- `raw/`의 논문이나 참고 자료를 읽는 step은 `reference_contract`를 `steps/index.json`에 선언해야 하며, `scripts/execute.py`는 완료 직전 source 파일, reference artifact, required item 존재를 검증한다.
+- `validation` step은 `validation_commands`와 `results_contract`를 `steps/index.json`에 선언해야 하며, `results_contract`에는 `validation_log_paths`도 포함해야 한다. `scripts/execute.py`는 완료 직전 schema, 산출물 필수 항목, validation command 실행 증빙을 검증한다.
+- `raw/`에 PDF 논문이 있으면 해당 step은 로컬 `pdf` 스킬을 사용해 필요한 식, 표, 파라미터, 검증 기준을 읽고 `steps/artifacts/reference/` 아래에 추출 산출물을 남긴다.
+- reference artifact가 생성된 뒤의 후속 step은 해당 정보가 필요할 때 가능하면 `raw/` 원본보다 `steps/artifacts/reference/` 아래의 추출 산출물을 우선 읽는다.
+- docs를 바꾼 뒤 재실행할 때 `steps/`만 삭제해도 충분하지 않다. executor는 현재 step 파일 외 Git worktree 변경이 남아 있으면 자동 실행을 중단하므로, docs 수정 후에는 step 외 변경을 먼저 commit/stash/cleanup하고 step 계획을 다시 만드는 것이 기본 절차다.
 - step이 `completed`로 표시되면 `scripts/execute.py`가 `/scripts/codex_repo_checks.sh`를 자동 실행한다.
 - 단, `/scripts/codex_repo_checks.sh`는 framework self-check이고 target CUDA/C++ 프로젝트의 `cmake`/`ctest`/case-run/result-compare 검증을 대체하지 않는다.
+- step auto-commit이 실패하면 executor는 warning으로 넘기지 않고 해당 step을 `error`로 바꾼 뒤 즉시 중단한다.
 - 구현 파일 변경 시 테스트 매핑 검사는 `/scripts/hooks/tdd-guard.sh`가 담당하며, 이는 `/scripts/codex_repo_checks.sh` 경유로 post-step validation에 포함된다.
 - 반복 에러 경고는 `/scripts/hooks/circuit-breaker.sh`가 담당한다.
 - 이 레포에서 Codex를 쓸 때는 가능하면 `/scripts/codex_run.sh`를 진입점으로 사용한다.

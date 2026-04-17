@@ -2,21 +2,21 @@
 
 Operational harness framework for future CUDA/C++ SPH work.
 
-이 레포의 기본 목적은 Codex가 CUDA/C++ 기반 전산해석 프로젝트를 문서 기반으로 계획하고, phase/step 단위로 자동 실행하며, 최소한의 safety checks와 validation 규칙을 강제하도록 만드는 것이다.
+이 레포의 기본 목적은 Codex가 CUDA/C++ 기반 전산해석 프로젝트를 문서 기반으로 계획하고, step 단위로 자동 실행하며, 최소한의 safety checks와 validation 규칙을 강제하도록 만드는 것이다.
 
 ## 핵심 실행 흐름
 
 현 레포의 기본 사용법은 아래 한 줄로 요약할 수 있다.
 
-`harness` 스킬 실행 -> `AGENTS.md`와 core docs 읽기 -> 사용자와 구현 범위와 validation 계획 구체화 -> 구현 계획을 phase/step으로 분해 -> phase 파일 생성 -> `scripts/execute.py` 실행 -> step 자동 실행 -> hook / repo checks 자동 검증
+`harness` 스킬 실행 -> `AGENTS.md`와 core docs 읽기 -> 사용자와 구현 범위와 validation 계획 구체화 -> 구현 계획을 step으로 분해 -> `steps/` 파일 생성 -> `scripts/execute.py` 실행 -> step 자동 실행 -> hook / repo checks 자동 검증
 
 조금 더 풀어 쓰면 다음 순서다.
 
 1. `harness` workflow를 시작한다.
 2. `AGENTS.md`, `docs/PRD.md`, `docs/ARCHITECTURE.md`, `docs/ADR.md`, `docs/RESULTS_POLICY.md`를 읽는다.
 3. 사용자와 구현 범위, 제약, validation 계획을 구체화한다.
-4. 계획을 `phases/index.json`, `phases/<task-name>/index.json`, `phases/<task-name>/stepN.md` 형태의 phase 파일로 만든다.
-5. `python3 scripts/execute.py <task-name>`를 실행한다.
+4. 계획을 `steps/index.json`, `steps/stepN.md` 형태의 step 파일로 만든다.
+5. `python3 scripts/execute.py`를 실행한다.
 6. executor가 step들을 순차 실행한다.
 7. 각 step 완료 시 hook / repo checks가 자동 검증한다.
 
@@ -34,6 +34,18 @@ Codex에서 이 레포를 trusted project로 쓰려면 `~/.codex/config.toml`에
 trust_level = "trusted"
 ```
 
+## raw 폴더
+
+`raw/`는 harness가 참고할 코드, 논문, 노트, 샘플 입력 같은 reference-only 자료를 두는 곳이다.
+
+- harness step은 필요하면 `raw/` 안의 파일을 읽어도 된다.
+- `raw/` 안의 일반 참고자료는 기본적으로 Git 추적 대상이 아니다.
+- 다만 `raw/README.md` 같은 tracked 파일 수정은 dirty worktree 차단에 걸린다.
+- `raw/` 내용은 step auto-commit에 포함되지 않는다.
+- `raw/` 안의 코드 조각은 TDD guard 대상이 아니다.
+- `raw/` 안의 PDF 논문은 로컬 `pdf` 스킬로 읽고, 필요한 식/표/파라미터/검증 기준은 `steps/artifacts/reference/` 아래에 추출 산출물로 남긴다.
+- 한 번 추출한 뒤에는 후속 step이 해당 정보가 필요할 때 `raw/` 원본을 반복해서 읽기보다 `steps/artifacts/reference/`의 산출물을 우선 재사용한다.
+
 ## 최소 명령어
 
 ### framework self-check
@@ -43,47 +55,80 @@ python3 -m pytest -q scripts
 bash scripts/codex_repo_checks.sh
 ```
 
-### phase 실행
+### harness 실행
 
 ```bash
-python3 scripts/execute.py <task-name>
-python3 scripts/execute.py <task-name> --push
+python3 scripts/execute.py
+python3 scripts/execute.py --push
 ```
 
-## phase 구조
+## docs 변경 후 재구동
+
+`steps/`만 삭제한다고 harness가 깨끗한 상태로 다시 시작되는 것은 아니다.
+
+`scripts/execute.py`는 실행 전에 현재 Git worktree를 검사하고, 현재 `steps/` 관련 파일 밖의 변경이 남아 있으면 자동 실행을 중단한다. 이는 step auto-commit에 unrelated 변경이 섞이는 것을 막기 위한 안전장치다.
+
+따라서 docs를 바꾼 뒤 하네스를 다시 돌릴 때의 기본 원칙은 다음과 같다.
+
+1. docs 변경을 먼저 정리한다.
+2. 기존 source/build/results/tmp 등 step 외 변경을 commit, stash, 또는 정리한다.
+3. `steps/index.json`, `steps/stepN.md`를 현재 docs 기준으로 다시 만든다.
+4. 그 다음 `python3 scripts/execute.py`를 실행한다.
+
+주의:
+
+- `steps/` 삭제만으로는 현재 세션 문맥이나 Git worktree 변경이 초기화되지 않는다.
+- 같은 Codex 세션에서는 이전에 읽은 step 내용이 대화 문맥에 남아 있을 수 있다.
+- 가장 깨끗한 재실행이 필요하면 새 step 계획 + 새 Codex 세션이 가장 안전하다.
+
+## step 구조
 
 ```text
-phases/
+steps/
 ├── index.json
-└── <task-name>/
-    ├── index.json
-    ├── step0.md
-    ├── step1.md
-    └── ...
+├── step0.md
+├── step1.md
+└── ...
 ```
 
 ## step 완료 조건
 
-- step 상태는 `phases/<task-name>/index.json`에서 관리한다.
-- target-project validation step은 `results_contract`를 step 항목에 선언해야 한다.
+- step 상태는 `steps/index.json`에서 관리한다.
+- 모든 step은 `type`을 선언해야 한다.
+- 허용되는 step type:
+  - `reference`
+  - `implementation`
+  - `validation`
+- `raw/`의 논문이나 참고 자료를 읽는 step은 `reference_contract`를 step 항목에 선언해야 한다.
+- `reference_contract` 최소 필드:
+  - `source_files`
+  - `output_paths`
+  - `required_items`
+- `validation` step은 `validation_commands`를 step 항목에 선언해야 한다.
+- `validation_commands`는 비어 있으면 안 된다.
+- `validation` step은 `results_contract`를 step 항목에 선언해야 한다.
 - `results_contract` 최소 필드:
   - `summary_path`
   - `output_paths`
   - `comparison_artifacts`
   - `comparison_basis`
+  - `validation_log_paths`
 
 executor는 완료 직전 아래를 검사한다.
 
-- 위험 프롬프트 preflight
+- 실행될 Acceptance Criteria / validation command에 대한 위험 명령 preflight
 - circuit breaker
 - repo self-check
-- `results_contract`에 선언한 결과 파일과 요약 섹션 존재 여부
+- step type/schema 유효성
+- `reference_contract`에 선언한 source/reference artifact와 required items 존재 여부
+- `results_contract`에 선언한 결과 파일, validation log, 요약 섹션, 실행 명령 증빙 존재 여부
 
 ## 참고
 
 - 실행 규칙: `AGENTS.md`
 - setup / 운영 설명: `docs/CODEX_SETUP.md`
 - 결과 산출물 계약: `docs/RESULTS_POLICY.md`
+- 로컬 스킬: `.codex/skills/harness`, `.codex/skills/review`, `.codex/skills/pdf`
 
 target CUDA/C++ 프로젝트 쪽 validation 패턴은 보통 아래 명령을 포함한다.
 

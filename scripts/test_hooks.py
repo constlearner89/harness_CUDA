@@ -65,6 +65,17 @@ class TestDangerousCmdGuard:
         assert clean_proc.returncode == 1
         assert rm_proc.returncode == 1
 
+    def test_allows_instructional_text_with_dangerous_example(self, tmp_path):
+        script = _copy_hook(tmp_path, "dangerous-cmd-guard.sh")
+        proc = subprocess.run(
+            [str(script), "금지사항: git reset --hard 를 사용하지 마라"],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+        )
+
+        assert proc.returncode == 0
+
 
 class TestTddGuard:
     def test_python_impl_requires_python_test(self, tmp_path):
@@ -153,6 +164,20 @@ class TestTddGuard:
 
         assert proc.returncode == 1
         assert "solver" in proc.stderr
+
+    def test_raw_reference_code_is_ignored(self, tmp_path):
+        script = _copy_hook(tmp_path, "tdd-guard.sh")
+        (tmp_path / "raw").mkdir()
+        (tmp_path / "raw" / "solver.cu").write_text("__global__ void run() {}\n", encoding="utf-8")
+
+        proc = subprocess.run(
+            [str(script), "raw/solver.cu"],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+        )
+
+        assert proc.returncode == 0
 
 
 class TestCodexRun:

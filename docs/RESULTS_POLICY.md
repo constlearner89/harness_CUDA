@@ -98,22 +98,25 @@ results/
 - 빌드 명령
 - 테스트 명령
 - 대표 실행 명령
+- 각 검증 명령의 실행 로그 경로
 - 핵심 결과 파일 경로
 - 비교 표 또는 비교 문장 1개 이상
 - 남은 리스크 또는 미검증 항목
 
 ## Harness Executor 계약
-- target-project validation step은 `phases/<task>/index.json`의 step 항목에 `results_contract`를 선언한다.
+- target-project validation step은 `steps/index.json`의 step 항목에 `results_contract`를 선언한다.
 - `results_contract` 최소 필드:
   - `summary_path`
   - `output_paths`
   - `comparison_artifacts`
   - `comparison_basis`
+  - `validation_log_paths`
 - executor는 완료 직전 아래를 검증한다.
   - `summary_path` 파일 존재
-  - `output_paths`와 `comparison_artifacts`에 선언한 경로 존재
-  - 요약 파일에 `실행 명령`, `출력 위치`, `비교 기준`, `핵심 결과` 섹션 존재
+  - `output_paths`, `comparison_artifacts`, `validation_log_paths`에 선언한 경로 존재
+  - 요약 파일에 `실행 명령`, `실행 로그 위치`, `출력 위치`, `비교 기준`, `핵심 결과` 섹션 존재
   - 요약 파일의 `비교 기준` 항목에 `comparison_basis`가 기록되어 있음
+  - `validation_commands`에 선언한 각 명령이 요약 파일과 validation log에 모두 기록되어 있음
 
 ## 결과 요약 템플릿
 ```md
@@ -122,6 +125,7 @@ results/
 - 변경 내용:
 - 입력 조건:
 - 실행 명령:
+- 실행 로그 위치:
 - 출력 위치:
 - 비교 기준:
 - 핵심 결과:

@@ -10,6 +10,11 @@ if [[ -z "$INPUT" ]]; then
   exit 0
 fi
 
+INSTRUCTIONAL_TEXT='사용하지 마라|사용 금지|금지사항|실행하지 마라|do not|don.t|avoid|forbidden|example|예시'
+if printf '%s\n' "$INPUT" | grep -Eiq "$INSTRUCTIONAL_TEXT"; then
+  exit 0
+fi
+
 RM_COMBINED='(^|[[:space:][:punct:]])rm([[:space:]]+--[^[:space:]]+)*([[:space:]]+-[[:alnum:]-]*r[[:alnum:]-]*f[[:alnum:]-]*|[[:space:]]+-[[:alnum:]-]*f[[:alnum:]-]*r[[:alnum:]-]*)([[:space:]]+--[^[:space:]]+)*([[:space:][:punct:]]|$)'
 RM_SPLIT_RF='(^|[[:space:][:punct:]])rm([[:space:]]+--[^[:space:]]+)*[[:space:]]+-[[:alnum:]-]*r[[:alnum:]-]*([[:space:]]+--[^[:space:]]+)*[[:space:]]+-[[:alnum:]-]*f[[:alnum:]-]*([[:space:][:punct:]]|$)'
 RM_SPLIT_FR='(^|[[:space:][:punct:]])rm([[:space:]]+--[^[:space:]]+)*[[:space:]]+-[[:alnum:]-]*f[[:alnum:]-]*([[:space:]]+--[^[:space:]]+)*[[:space:]]+-[[:alnum:]-]*r[[:alnum:]-]*([[:space:][:punct:]]|$)'

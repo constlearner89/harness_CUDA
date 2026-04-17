@@ -21,13 +21,13 @@
 - 사용자가 `harness` workflow를 요청하면 Codex는 다음 순서를 따른다.
   1. `/AGENTS.md`, `/docs/PRD.md`, `/docs/ARCHITECTURE.md`, `/docs/ADR.md`, `/docs/RESULTS_POLICY.md`를 읽는다.
   2. 사용자와 논의해 구현 범위와 계획을 구체화한다.
-  3. 구현 계획을 phase와 step으로 쪼개 `phases/index.json`, `phases/<task>/index.json`, `phases/<task>/stepN.md`를 만든다.
-  4. 사용자가 중단시키지 않는 한 `python3 scripts/execute.py <task-name>`를 실행해 phase를 순차 자동 실행한다.
+  3. 구현 계획을 ordered step으로 쪼개 `steps/index.json`, `steps/stepN.md`를 만든다.
+  4. 사용자가 중단시키지 않는 한 `python3 scripts/execute.py`를 실행해 step을 순차 자동 실행한다.
   5. 실행 결과를 검토하고 필요하면 docs와 규칙을 다시 보강한다.
 
 ### Layer 4 — Hooks / Auto Validation
 
-- hook/guard 계층은 phase 실행 전후의 자동 검증과 안전 장치를 담당한다.
+- hook/guard 계층은 step 실행 전후의 자동 검증과 안전 장치를 담당한다.
 - 기본 구성은 아래 스크립트다.
   - `scripts/hooks/tdd-guard.sh`
   - `scripts/hooks/dangerous-cmd-guard.sh`
@@ -52,23 +52,33 @@
 - CRITICAL: harness step에 주입되는 규칙은 반드시 `/AGENTS.md`, `/docs/PRD.md`, `/docs/ARCHITECTURE.md`, `/docs/ADR.md`, `/docs/RESULTS_POLICY.md`에서 읽어 구성한다.
 - CRITICAL: 위험 명령 차단, TDD guard, circuit breaker는 우회 경로 없이 자동 실행 경로에 연결한다.
 - `scripts/hooks/`는 guardrail만 담당하고, 오케스트레이션 책임은 `scripts/execute.py`와 `scripts/codex_run.sh`에 둔다.
+- `raw/`는 코드나 논문 등 reference-only 자료를 두는 로컬 입력 영역이다. harness는 이 폴더를 읽을 수 있고 자동 커밋/TDD guard 대상에서는 제외한다. 단, 추적 중인 `raw/` 파일 수정은 다른 tracked 파일과 동일하게 dirty-worktree 차단 대상이다.
+- `raw/`에 PDF 논문이 있으면 필요한 step만 로컬 `pdf` 스킬을 사용해 식, 표, 파라미터, 검증 기준을 추출할 수 있어야 한다. 이런 step은 `reference_contract`를 선언하고, 추출 결과를 `steps/artifacts/reference/` 아래 재사용 가능한 텍스트/markdown 형태로 남긴다.
+- `reference` step이 `steps/artifacts/reference/` 아래 산출물을 만들었다면, 후속 step은 해당 정보가 필요할 때 특별한 이유가 없는 한 `raw/` 원본보다 그 reference artifact를 우선 읽는다.
 - framework 자체 테스트와 target project 검증 규칙을 혼동하지 않는다.
+- 모든 step은 `type`을 가져야 하며 허용값은 `reference`, `implementation`, `validation`이다.
 
 ## 개발 프로세스
 - CRITICAL: 새 기능 구현 시 반드시 실패하는 테스트 또는 재현 가능한 검증부터 추가하고, 그 다음 구현을 수정한다.
-- CRITICAL: phase step은 framework 자체 검증만으로 완료 처리하면 안 된다. 대상 CUDA/C++ 프로젝트에 대해 최소한 빌드, 테스트, 대표 케이스 실행 또는 결과 비교를 포함한 검증을 수행해야 한다.
+- CRITICAL: step은 framework 자체 검증만으로 완료 처리하면 안 된다. 대상 CUDA/C++ 프로젝트에 대해 최소한 빌드, 테스트, 대표 케이스 실행 또는 결과 비교를 포함한 검증을 수행해야 한다.
 - CRITICAL: target-project validation의 기본 모델은 `cmake -S . -B build`, `cmake --build build`, `ctest --test-dir build --output-on-failure`, 대표 solver 실행, 결과 비교 스크립트 실행이다. step은 이 중 해당 작업에 필요한 명령을 Acceptance Criteria에 명시해야 한다.
+- CRITICAL: step auto-commit이 실패하면 해당 step은 완료가 아니며 즉시 `error`로 처리한다.
 - 변경 후에는 최소한 `bash scripts/codex_repo_checks.sh`를 통과시킨다.
 - framework 검증과 target-project 검증은 둘 다 필요하다. `scripts/codex_repo_checks.sh`는 framework self-check일 뿐 target scientific validation을 대체하지 않는다.
-- target-project validation이 포함된 step은 `results_contract`를 `phases/<task>/index.json` step 항목에 명시해야 한다. 최소 필드는 `summary_path`, `output_paths`, `comparison_artifacts`, `comparison_basis`다.
-- target-project validation이 포함된 step은 `docs/RESULTS_POLICY.md`의 최소 산출물 계약을 충족해야 완료로 간주한다. 최소한 실행 명령, 출력 위치, 비교 기준, 비교 산출물, 요약 기록이 남아 있어야 하며, executor는 `results_contract`에 선언된 경로와 요약 파일 필수 섹션을 검증한다.
+- 모든 step은 `steps/index.json`에서 `type`을 명시해야 한다. `reference`는 참고자료 추출, `implementation`은 코드 변경, `validation`은 빌드/테스트/케이스 실행/결과 비교를 담당한다.
+- `raw/`의 논문이나 참고 자료를 읽는 step은 `reference_contract`를 `steps/index.json` step 항목에 명시해야 한다. 최소 필드는 `source_files`, `output_paths`, `required_items`다.
+- `validation` step은 `validation_commands`를 `steps/index.json` step 항목에 명시해야 한다. 비어 있으면 안 되며, step은 이 명령들을 모두 직접 실행해야 한다.
+- `validation` step은 `results_contract`를 `steps/index.json` step 항목에 명시해야 한다. 최소 필드는 `summary_path`, `output_paths`, `comparison_artifacts`, `comparison_basis`, `validation_log_paths`다.
+- `reference_contract`가 있는 step은 선언된 source 파일과 reference artifact가 실제로 존재해야 하고, `required_items`에 적은 핵심 항목이 추출 산출물에 포함돼야 완료로 간주한다.
+- target-project validation이 포함된 step은 `docs/RESULTS_POLICY.md`의 최소 산출물 계약을 충족해야 완료로 간주한다. 최소한 실행 명령, 실행 로그 위치, 출력 위치, 비교 기준, 비교 산출물, 요약 기록이 남아 있어야 하며, executor는 `results_contract`에 선언된 경로와 요약 파일 필수 섹션, validation command 실행 증빙을 검증한다.
 - `harness` workflow에서는 계획 수립 뒤 사용자가 중단시키지 않는 한 `scripts/execute.py` 실행까지 이어서 처리한다.
 - 커밋 메시지는 conventional commits 형식을 따른다.
+- docs를 변경한 뒤 하네스를 다시 돌릴 때는 `steps/`만 삭제하지 말고, 현재 step 파일 외 worktree 변경을 먼저 정리한다. 기본 원칙은 docs 정리 -> step 외 변경 commit/stash/cleanup -> 새 step 계획 생성 -> `scripts/execute.py` 재실행이다.
 
 ## Framework Repo Commands
 python3 -m pytest -q scripts
 bash scripts/codex_repo_checks.sh
-python3 scripts/execute.py <task-name>
+python3 scripts/execute.py
 bash scripts/codex_run.sh --run-checks exec "<prompt>"
 
 ## Target Project Validation Pattern

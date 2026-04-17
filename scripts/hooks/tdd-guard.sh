@@ -88,6 +88,7 @@ for file in "${changed_files[@]}"; do
   requires_test_guard "$file" || continue
   is_test_file "$file" && continue
   [[ "$file" == scripts/hooks/* ]] && continue
+  [[ "$file" == raw/* ]] && continue
 
   base="$(basename "$file")"
   ext="${base##*.}"

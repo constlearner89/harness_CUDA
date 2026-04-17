@@ -4,11 +4,15 @@ out/
 next-env.d.ts
 tsconfig.tsbuildinfo
 
-# phase execution outputs
-phases/**/phase*-output.json
-phases/**/step*-output.json
+# step execution outputs
+steps/step*-output.json
 scripts/__pycache__/
 .codex/tmp/
 
 # Terminal Paste Image folder
 .cp-images/
+
+# local reference materials for harness planning
+raw/*
+!raw/.gitkeep
+!raw/README.md

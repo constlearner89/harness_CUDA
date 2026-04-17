@@ -27,6 +27,8 @@ if [[ -n "$COMMAND_STRING" ]]; then
   "$ROOT/scripts/hooks/dangerous-cmd-guard.sh" "$COMMAND_STRING"
 fi
 
+echo "[codex_run] starting: codex ${*:-<interactive>}" >&2
+
 set +e
 if [[ $# -eq 0 ]]; then
   codex -C "$ROOT"
@@ -38,10 +40,14 @@ fi
 set -e
 
 if (( exit_code != 0 )); then
+  echo "[codex_run] Codex exited with code ${exit_code}." >&2
   "$ROOT/scripts/hooks/circuit-breaker.sh" "codex_run exit code ${exit_code}: $* " || true
+else
+  echo "[codex_run] Codex finished successfully." >&2
 fi
 
 if [[ $RUN_CHECKS -eq 1 ]]; then
+  echo "[codex_run] running repo checks." >&2
   set +e
   "$ROOT/scripts/codex_repo_checks.sh"
   checks_exit_code=$?
@@ -51,6 +57,8 @@ if [[ $RUN_CHECKS -eq 1 ]]; then
     if (( exit_code == 0 )); then
       exit "$checks_exit_code"
     fi
+  else
+    echo "[codex_run] repo checks passed." >&2
   fi
 fi
 

@@ -5,6 +5,7 @@ execute.py 리팩터링 안전망 테스트.
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -41,6 +42,7 @@ def steps_dir(tmp_project):
     index = {
         "project": "TestProject",
         "goal": "mvp",
+        "validation_scope": "framework",
         "steps": [
             {"step": 0, "name": "setup", "type": "implementation", "status": "completed", "summary": "프로젝트 초기화 완료"},
             {"step": 1, "name": "core", "type": "implementation", "status": "completed", "summary": "핵심 로직 구현"},
@@ -160,6 +162,8 @@ class TestBuildPreamble:
         assert "steps/artifacts/reference" in result
         assert "해당 정보가 필요할 때" in result
         assert "step type" in result
+        assert "non-interactive one-shot command" in result
+        assert "Python 기반 추출" in result
 
     def test_retry_section_with_prev_error(self, executor):
         result = executor._build_preamble("", "", prev_error="타입 에러")
@@ -240,6 +244,56 @@ class TestCheckCleanWorktree:
         with pytest.raises(SystemExit) as exc_info:
             executor._check_clean_worktree()
         assert exc_info.value.code == 1
+
+    def test_allows_untracked_generated_outputs(self, executor):
+        executor._run_git = lambda *args: MagicMock(
+            returncode=0,
+            stdout="?? build/CMakeCache.txt\n?? results/case/summary.md\n?? steps/index.json\n",
+            stderr="",
+        )
+        executor._check_clean_worktree()
+
+
+class TestValidationScope:
+    def test_framework_scope_rejects_external_target_commands(self, executor):
+        index = executor._read_json(executor._index_file)
+        for item in index["steps"]:
+            if item["step"] == 2:
+                item["type"] = "validation"
+                item["validation_commands"] = ["cmake -S . -B build", "ctest --test-dir build --output-on-failure"]
+                item["results_contract"] = {
+                    "summary_path": "results/case/summary.md",
+                    "output_paths": ["results/case/run.log"],
+                    "comparison_artifacts": ["results/case/comparison.svg"],
+                    "comparison_basis": "baseline",
+                    "validation_log_paths": ["results/case/validation.log"],
+                }
+        executor._write_json(executor._index_file, index)
+
+        error = executor._validate_validation_scope(index)
+        assert "framework validation_scope" in error
+
+    def test_external_target_requires_existing_cmake_project(self, executor, tmp_project):
+        index = executor._read_json(executor._index_file)
+        index["validation_scope"] = "external-target"
+        index["target_root"] = "target"
+        target_root = tmp_project / "target"
+        target_root.mkdir()
+        executor._write_json(executor._index_file, index)
+
+        error = executor._validate_validation_scope(index)
+        assert "CMakeLists.txt" in error
+
+    def test_external_target_accepts_existing_cmake_project(self, executor, tmp_project):
+        index = executor._read_json(executor._index_file)
+        index["validation_scope"] = "external-target"
+        index["target_root"] = "target"
+        target_root = tmp_project / "target"
+        target_root.mkdir()
+        (target_root / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
+        executor._write_json(executor._index_file, index)
+
+        assert executor._validate_validation_scope(index) is None
 
 
 class TestCommitStep:
@@ -336,13 +390,39 @@ class TestInvokeCodex:
             self.kill_called = True
             self._poll_values = [self.returncode]
 
+    def test_open_codex_stdin_prefers_parent_tty(self, executor):
+        fake_stdin = SimpleNamespace()
+        fake_stdin.fileno = lambda: 0
+
+        with patch.object(sys, "stdin", fake_stdin):
+            with patch("os.isatty", return_value=True):
+                stdin_handle, cleanup_handles, mode = executor._open_codex_stdin()
+
+        assert stdin_handle is fake_stdin
+        assert cleanup_handles == []
+        assert mode == "parent-tty"
+
+    def test_open_codex_stdin_uses_pty_without_parent_tty(self, executor):
+        fake_master = MagicMock()
+        fake_slave = MagicMock()
+
+        with patch("os.isatty", return_value=False):
+            with patch("pty.openpty", return_value=(11, 12)):
+                with patch("os.fdopen", side_effect=[fake_master, fake_slave]):
+                    stdin_handle, cleanup_handles, mode = executor._open_codex_stdin()
+
+        assert stdin_handle is fake_slave
+        assert cleanup_handles == [fake_master, fake_slave]
+        assert mode == "pty"
+
     def test_invokes_codex_with_correct_args(self, executor):
         fake_proc = self.FakePopen(returncode=0, stdout='{"result": "ok"}', stderr="")
         step = {"step": 2, "name": "ui"}
 
         with patch.object(ex.StepExecutor, "_validate_prompt_safety", return_value=None):
-            with patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
-                output = executor._invoke_codex(step, "PREAMBLE\n")
+            with patch.object(ex.StepExecutor, "_open_codex_stdin", return_value=(subprocess.DEVNULL, [], "mock")):
+                with patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
+                    output = executor._invoke_codex(step, "PREAMBLE\n")
 
         cmd = mock_popen.call_args[0][0]
         assert cmd[0] == "codex"
@@ -351,15 +431,40 @@ class TestInvokeCodex:
         assert "PREAMBLE" in cmd[-1]
         assert "UI를 구현하세요" in cmd[-1]
         assert output["forcedStop"] is False
+        assert output["failureCategory"] is None
+
+    def test_records_failure_metadata_for_stall_pattern(self, executor):
+        fake_proc = self.FakePopen(returncode=1, stdout="", stderr="")
+        step = {"step": 2, "name": "ui"}
+
+        def fake_popen(*args, **kwargs):
+            kwargs["stderr"].write("ERROR write_stdin failed: stdin is closed for this session\n")
+            kwargs["stderr"].flush()
+            return fake_proc
+
+        with patch.object(ex.StepExecutor, "_validate_prompt_safety", return_value=None):
+            with patch.object(ex.StepExecutor, "_open_codex_stdin", return_value=(subprocess.DEVNULL, [], "mock")):
+                with patch("subprocess.Popen", side_effect=fake_popen):
+                    output = executor._invoke_codex(step, "PREAMBLE\n")
+
+        assert output["failureCategory"] == "stall"
+        assert "stdin is closed" in output["stderrTail"]
+        assert output["lastKnownStatus"] == "pending"
+        assert output["startedAt"]
+        assert output["endedAt"]
 
     def test_saves_output_json(self, executor):
         fake_proc = self.FakePopen(returncode=0, stdout='{"ok": true}', stderr="")
         with patch.object(ex.StepExecutor, "_validate_prompt_safety", return_value=None):
-            with patch("subprocess.Popen", return_value=fake_proc):
-                executor._invoke_codex({"step": 2, "name": "ui"}, "preamble")
+            with patch.object(ex.StepExecutor, "_open_codex_stdin", return_value=(subprocess.DEVNULL, [], "mock")):
+                with patch("subprocess.Popen", return_value=fake_proc):
+                    executor._invoke_codex({"step": 2, "name": "ui"}, "preamble")
         output_file = executor._steps_dir / "step2-output.json"
         assert output_file.exists()
-        assert json.loads(output_file.read_text(encoding="utf-8"))["exitCode"] == 0
+        written = json.loads(output_file.read_text(encoding="utf-8"))
+        assert written["exitCode"] == 0
+        assert written["failureCategory"] is None
+        assert written["stdinMode"] == "mock"
 
     def test_nonexistent_step_file_exits(self, executor):
         with pytest.raises(SystemExit) as exc_info:
@@ -378,11 +483,13 @@ class TestInvokeCodex:
 
         fake_proc = self.FakePopen(returncode=0, stdout="ok", stderr="", poll_values=[None, None, None, 0], on_poll=mark_completed)
         with patch.object(ex.StepExecutor, "_validate_prompt_safety", return_value=None):
-            with patch.object(ex.StepExecutor, "POST_STEP_GRACE", 0):
-                with patch("subprocess.Popen", return_value=fake_proc):
-                    output = executor._invoke_codex({"step": 2, "name": "ui"}, "preamble")
+            with patch.object(ex.StepExecutor, "_open_codex_stdin", return_value=(subprocess.DEVNULL, [], "mock")):
+                with patch.object(ex.StepExecutor, "POST_STEP_GRACE", 0):
+                    with patch("subprocess.Popen", return_value=fake_proc):
+                        output = executor._invoke_codex({"step": 2, "name": "ui"}, "preamble")
         assert output["forcedStop"] is True
         assert fake_proc.terminate_called is True
+        assert output["failureCategory"] is None
 
 
 class TestProgressIndicator:
@@ -447,6 +554,33 @@ class TestCheckBlockers:
 
 
 class TestExecuteSingleStep:
+    def test_emits_stage_logs_for_completed_step(self, executor, capsys):
+        def fake_invoke(step, preamble):
+            index = executor._read_json(executor._index_file)
+            for item in index["steps"]:
+                if item["step"] == step["step"]:
+                    item["status"] = "completed"
+                    item["summary"] = "done"
+            executor._write_json(executor._index_file, index)
+
+        executor._invoke_codex = fake_invoke
+        executor._run_repo_checks = lambda: MagicMock(returncode=0, stderr="")
+        executor._commit_step = lambda *args: None
+
+        with patch.object(ex, "progress_indicator") as mock_progress:
+            cm = MagicMock()
+            cm.__enter__.return_value = MagicMock(elapsed=0)
+            cm.__exit__.return_value = False
+            mock_progress.return_value = cm
+            assert executor._execute_single_step({"step": 2, "name": "ui"}, "guards") is True
+
+        out = capsys.readouterr().out
+        assert "starting (attempt 1/3)" in out
+        assert "running Codex executor" in out
+        assert "running post-step repo checks" in out
+        assert "recording completion commit" in out
+        assert "completed successfully" in out
+
     def test_validation_step_without_commands_fails_fast(self, executor):
         index = executor._read_json(executor._index_file)
         for item in index["steps"]:
@@ -578,6 +712,7 @@ class TestExecuteSingleStep:
 
     def test_results_contract_success_allows_completion(self, executor):
         with patch.object(ex, "ROOT", Path(executor._root)):
+            (Path(executor._root) / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
             results_dir = Path(executor._root) / "results" / "case"
             results_dir.mkdir(parents=True)
             (results_dir / "run.log").write_text("ok", encoding="utf-8")
@@ -597,6 +732,8 @@ class TestExecuteSingleStep:
             )
 
             index = executor._read_json(executor._index_file)
+            index["validation_scope"] = "external-target"
+            index["target_root"] = "."
             for item in index["steps"]:
                 if item["step"] == 2:
                     item["type"] = "validation"
@@ -631,6 +768,7 @@ class TestExecuteSingleStep:
 
     def test_results_contract_missing_validation_log_fails_completion(self, executor):
         with patch.object(ex, "ROOT", Path(executor._root)):
+            (Path(executor._root) / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
             results_dir = Path(executor._root) / "results" / "case"
             results_dir.mkdir(parents=True)
             (results_dir / "run.log").write_text("ok", encoding="utf-8")
@@ -646,6 +784,8 @@ class TestExecuteSingleStep:
             )
 
             index = executor._read_json(executor._index_file)
+            index["validation_scope"] = "external-target"
+            index["target_root"] = "."
             for item in index["steps"]:
                 if item["step"] == 2:
                     item["type"] = "validation"
@@ -687,6 +827,7 @@ class TestExecuteSingleStep:
 
     def test_results_contract_missing_command_evidence_fails_completion(self, executor):
         with patch.object(ex, "ROOT", Path(executor._root)):
+            (Path(executor._root) / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
             results_dir = Path(executor._root) / "results" / "case"
             results_dir.mkdir(parents=True)
             (results_dir / "run.log").write_text("ok", encoding="utf-8")
@@ -703,6 +844,8 @@ class TestExecuteSingleStep:
             )
 
             index = executor._read_json(executor._index_file)
+            index["validation_scope"] = "external-target"
+            index["target_root"] = "."
             for item in index["steps"]:
                 if item["step"] == 2:
                     item["type"] = "validation"
@@ -768,3 +911,12 @@ class TestExecuteSingleStep:
         step_entry = next(item for item in updated["steps"] if item["step"] == 2)
         assert step_entry["status"] == "error"
         assert "[commit]" in step_entry["error_message"]
+
+
+class TestFinalize:
+    def test_prints_completion_notice(self, executor, capsys):
+        executor._run_git = lambda *args: MagicMock(returncode=0, stdout="", stderr="")
+        executor._finalize()
+        out = capsys.readouterr().out
+        assert "run completed at" in out
+        assert "Goal 'mvp' completed!" in out

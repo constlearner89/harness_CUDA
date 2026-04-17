@@ -82,11 +82,17 @@ trust_level = "trusted"
 - 하네스 step 실행 시 안전 규칙은 `scripts/execute.py` 프롬프트에 직접 주입된다.
 - step 프롬프트에는 `/docs/PRD.md`, `/docs/ARCHITECTURE.md`, `/docs/ADR.md`, `/docs/RESULTS_POLICY.md`를 핵심 guardrail 문서로 주입한다.
 - 모든 step은 `type`을 가져야 하며 허용값은 `reference`, `implementation`, `validation`이다.
+- `steps/index.json` 최상위에는 `validation_scope`를 둔다. 허용값은 `framework`, `external-target`이다.
+- `validation_scope`가 `external-target`이면 `target_root`도 선언해야 하며, executor는 step 실행 전에 해당 경로와 `CMakeLists.txt` 존재를 선검사한다.
 - `raw/`의 논문이나 참고 자료를 읽는 step은 `reference_contract`를 `steps/index.json`에 선언해야 하며, `scripts/execute.py`는 완료 직전 source 파일, reference artifact, required item 존재를 검증한다.
 - `validation` step은 `validation_commands`와 `results_contract`를 `steps/index.json`에 선언해야 하며, `results_contract`에는 `validation_log_paths`도 포함해야 한다. `scripts/execute.py`는 완료 직전 schema, 산출물 필수 항목, validation command 실행 증빙을 검증한다.
+- `validation_scope`가 `framework`이면 framework self-check만 수행한다. `cmake`, `ctest`, `./build/...` 같은 external target 명령은 validation command로 넣지 않는다.
 - `raw/`에 PDF 논문이 있으면 해당 step은 로컬 `pdf` 스킬을 사용해 필요한 식, 표, 파라미터, 검증 기준을 읽고 `steps/artifacts/reference/` 아래에 추출 산출물을 남긴다.
+- PDF 텍스트 추출은 `pypdf`, `pdfplumber` 같은 Python 경로를 먼저 시도하고, Poppler CLI는 시각 검토가 필요할 때만 보조적으로 사용한다.
+- Poppler CLI가 없다는 이유만으로 reference step을 즉시 `blocked` 처리하지 않는다.
 - reference artifact가 생성된 뒤의 후속 step은 해당 정보가 필요할 때 가능하면 `raw/` 원본보다 `steps/artifacts/reference/` 아래의 추출 산출물을 우선 읽는다.
 - docs를 바꾼 뒤 재실행할 때 `steps/`만 삭제해도 충분하지 않다. executor는 현재 step 파일 외 Git worktree 변경이 남아 있으면 자동 실행을 중단하므로, docs 수정 후에는 step 외 변경을 먼저 commit/stash/cleanup하고 step 계획을 다시 만드는 것이 기본 절차다.
+- 단, untracked `build/`, `results/`, `cmake-build-*` 같은 generated output은 dirty worktree 차단에서 제외된다.
 - step이 `completed`로 표시되면 `scripts/execute.py`가 `/scripts/codex_repo_checks.sh`를 자동 실행한다.
 - 단, `/scripts/codex_repo_checks.sh`는 framework self-check이고 target CUDA/C++ 프로젝트의 `cmake`/`ctest`/case-run/result-compare 검증을 대체하지 않는다.
 - step auto-commit이 실패하면 executor는 warning으로 넘기지 않고 해당 step을 `error`로 바꾼 뒤 즉시 중단한다.

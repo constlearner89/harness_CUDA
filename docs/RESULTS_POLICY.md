@@ -25,6 +25,7 @@
 - 결과 디렉토리는 기능별 또는 논문별로 나누고, 기준 케이스와 변형 케이스를 함께 두지 않는다.
 - 후처리 스크립트가 읽는 출력 포맷은 임의 변경하지 않는다.
 - 그래프나 표를 만들었다면 어떤 원시 데이터에서 생성했는지 추적 가능해야 한다.
+- 비교 산출물은 외부 plotting 패키지 없이도 재생성 가능한 형식을 우선한다. 기본 권장 순서는 `csv`, `md`, `svg`이며 `png`는 선택적 보조 산출물이다.
 
 ## 권장 디렉토리 예시
 ```text
@@ -54,6 +55,13 @@ results/
 - 시간에 따른 보존량 변화 그래프
 - 논문 표/그래프와의 정성 또는 정량 비교
 - 동일 케이스에서 변경 전후 결과 스냅샷 비교
+
+논문 figure overlay 기본 산출물:
+
+- sampled profile raw data (`.csv`)
+- comparison summary (`.md`)
+- overlay figure (`.svg`)
+- 필요 시 추가 PNG
 
 ## 비교 기준 우선순위
 1. 기존 target-project baseline과의 비교
@@ -111,6 +119,7 @@ results/
   - `comparison_artifacts`
   - `comparison_basis`
   - `validation_log_paths`
+- `comparison_artifacts`는 가능하면 dependency-free 형식을 우선한다. 예: `.md`, `.csv`, `.svg`
 - executor는 완료 직전 아래를 검증한다.
   - `summary_path` 파일 존재
   - `output_paths`, `comparison_artifacts`, `validation_log_paths`에 선언한 경로 존재

@@ -37,6 +37,16 @@ requires_test_guard() {
   return 1
 }
 
+is_generated_output() {
+  local file="$1"
+  case "$file" in
+    build/*|results/*|cmake-build-*/*|*/CMakeFiles/*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 has_related_native_test() {
   local base="$1"
 
@@ -85,6 +95,7 @@ changed_set="$(printf '%s\n' "${changed_files[@]}")"
 missing=()
 
 for file in "${changed_files[@]}"; do
+  is_generated_output "$file" && continue
   requires_test_guard "$file" || continue
   is_test_file "$file" && continue
   [[ "$file" == scripts/hooks/* ]] && continue

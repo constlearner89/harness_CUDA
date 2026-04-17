@@ -57,6 +57,8 @@
 - `reference` step이 `steps/artifacts/reference/` 아래 산출물을 만들었다면, 후속 step은 해당 정보가 필요할 때 특별한 이유가 없는 한 `raw/` 원본보다 그 reference artifact를 우선 읽는다.
 - framework 자체 테스트와 target project 검증 규칙을 혼동하지 않는다.
 - 모든 step은 `type`을 가져야 하며 허용값은 `reference`, `implementation`, `validation`이다.
+- `steps/index.json` 최상위에는 `validation_scope`를 둔다. 허용값은 `framework`, `external-target`이다.
+- `validation_scope`가 `external-target`이면 `steps/index.json` 최상위에 `target_root`를 선언해야 하며, 해당 경로는 실제 `CMakeLists.txt`를 포함한 target 프로젝트 루트여야 한다.
 
 ## 개발 프로세스
 - CRITICAL: 새 기능 구현 시 반드시 실패하는 테스트 또는 재현 가능한 검증부터 추가하고, 그 다음 구현을 수정한다.
@@ -69,8 +71,11 @@
 - `raw/`의 논문이나 참고 자료를 읽는 step은 `reference_contract`를 `steps/index.json` step 항목에 명시해야 한다. 최소 필드는 `source_files`, `output_paths`, `required_items`다.
 - `validation` step은 `validation_commands`를 `steps/index.json` step 항목에 명시해야 한다. 비어 있으면 안 되며, step은 이 명령들을 모두 직접 실행해야 한다.
 - `validation` step은 `results_contract`를 `steps/index.json` step 항목에 명시해야 한다. 최소 필드는 `summary_path`, `output_paths`, `comparison_artifacts`, `comparison_basis`, `validation_log_paths`다.
+- `validation_scope`가 `framework`이면 framework self-check 범위만 허용한다. 이때 `cmake`, `ctest`, `./build/...` 같은 external target 명령을 step validation command로 넣으면 안 된다.
+- `validation_scope`가 `external-target`이면 executor는 step 실행 전에 `target_root` 존재 여부와 `CMakeLists.txt` 존재 여부를 선검사한다. 성립하지 않으면 step 내부에서 오래 시도하지 않고 즉시 오류로 종료한다.
 - `reference_contract`가 있는 step은 선언된 source 파일과 reference artifact가 실제로 존재해야 하고, `required_items`에 적은 핵심 항목이 추출 산출물에 포함돼야 완료로 간주한다.
 - target-project validation이 포함된 step은 `docs/RESULTS_POLICY.md`의 최소 산출물 계약을 충족해야 완료로 간주한다. 최소한 실행 명령, 실행 로그 위치, 출력 위치, 비교 기준, 비교 산출물, 요약 기록이 남아 있어야 하며, executor는 `results_contract`에 선언된 경로와 요약 파일 필수 섹션, validation command 실행 증빙을 검증한다.
+- `raw/`의 PDF를 읽는 reference step은 Poppler CLI 유무만으로 `blocked` 처리하지 않는다. 텍스트 추출은 `pypdf` 또는 `pdfplumber` 같은 Python 경로를 먼저 시도하고, Poppler는 시각 검토가 필요할 때만 보조적으로 사용한다.
 - `harness` workflow에서는 계획 수립 뒤 사용자가 중단시키지 않는 한 `scripts/execute.py` 실행까지 이어서 처리한다.
 - 커밋 메시지는 conventional commits 형식을 따른다.
 - docs를 변경한 뒤 하네스를 다시 돌릴 때는 `steps/`만 삭제하지 말고, 현재 step 파일 외 worktree 변경을 먼저 정리한다. 기본 원칙은 docs 정리 -> step 외 변경 commit/stash/cleanup -> 새 step 계획 생성 -> `scripts/execute.py` 재실행이다.

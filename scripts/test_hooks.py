@@ -179,6 +179,20 @@ class TestTddGuard:
 
         assert proc.returncode == 0
 
+    def test_generated_build_output_is_ignored(self, tmp_path):
+        script = _copy_hook(tmp_path, "tdd-guard.sh")
+        (tmp_path / "build").mkdir()
+        (tmp_path / "build" / "generated.cu").write_text("__global__ void run() {}\n", encoding="utf-8")
+
+        proc = subprocess.run(
+            [str(script), "build/generated.cu"],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+        )
+
+        assert proc.returncode == 0
+
 
 class TestCodexRun:
     def test_exec_prompt_is_guarded(self, tmp_path):
@@ -243,6 +257,32 @@ class TestCodexRun:
         state_file = tmp_path / ".codex" / "tmp" / "circuit_breaker.log"
         assert state_file.exists()
         assert "codex_run exit code 7" in state_file.read_text(encoding="utf-8")
+
+    def test_prints_start_and_finish_messages(self, tmp_path):
+        script = tmp_path / "scripts" / "codex_run.sh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / "scripts" / "codex_run.sh", script)
+        os.chmod(script, 0o755)
+        _copy_hook(tmp_path, "dangerous-cmd-guard.sh")
+        _copy_hook(tmp_path, "circuit-breaker.sh")
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        codex_bin = bin_dir / "codex"
+        codex_bin.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        os.chmod(codex_bin, 0o755)
+
+        proc = subprocess.run(
+            [str(script), "exec", "safe prompt"],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+
+        assert proc.returncode == 0
+        assert "[codex_run] starting:" in proc.stderr
+        assert "[codex_run] Codex finished successfully." in proc.stderr
 
     def test_run_checks_preserves_original_codex_failure(self, tmp_path):
         script = tmp_path / "scripts" / "codex_run.sh"

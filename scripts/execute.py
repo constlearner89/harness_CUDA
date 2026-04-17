@@ -8,9 +8,12 @@ Usage:
 
 import argparse
 import contextlib
+import importlib.util
 import json
 import os
+import pty
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -66,6 +69,10 @@ class StepExecutor:
     CIRCUIT_BREAKER_THRESHOLD = 2
     GUARDRAIL_DOCS = ("PRD.md", "ARCHITECTURE.md", "ADR.md", "RESULTS_POLICY.md")
     STEP_TYPES = ("reference", "implementation", "validation")
+    VALIDATION_SCOPES = ("framework", "external-target")
+    GENERATED_PATH_PREFIXES = ("build/", "results/", "cmake-build-")
+    GENERATED_PATH_PARTS = ("/CMakeFiles/",)
+    STALL_PATTERNS = ("write_stdin failed", "stdin is closed for this session")
     FEAT_MSG = "feat({goal}): step {num} - {name}"
     CHORE_MSG = "chore({goal}): step {num} output"
     TZ = timezone(timedelta(hours=9))
@@ -96,6 +103,7 @@ class StepExecutor:
         self._checkout_branch()
         guardrails = self._load_guardrails()
         self._ensure_created_at()
+        self._validate_run_preflight()
         self._execute_all_steps(guardrails)
         self._finalize()
 
@@ -114,6 +122,9 @@ class StepExecutor:
         index = self._read_json(self._index_file)
         return next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
 
+    def _log(self, message: str):
+        print(f"  [{self._stamp()}] {message}")
+
     def _run_git(self, *args) -> subprocess.CompletedProcess:
         return subprocess.run(["git", *args], cwd=self._root, capture_output=True, text=True)
 
@@ -123,6 +134,15 @@ class StepExecutor:
         if " -> " in entry:
             entry = entry.split(" -> ", 1)[1]
         return entry.strip()
+
+    @classmethod
+    def _is_generated_path(cls, path: str) -> bool:
+        normalized = path.strip()
+        if not normalized:
+            return False
+        if normalized.startswith(cls.GENERATED_PATH_PREFIXES):
+            return True
+        return any(part in normalized for part in cls.GENERATED_PATH_PARTS)
 
     def _run_hook(self, script_name: str, *args, env: Optional[dict] = None):
         script_path = ROOT / "scripts" / "hooks" / script_name
@@ -182,6 +202,8 @@ class StepExecutor:
             if not path:
                 continue
             if path.startswith("steps/"):
+                continue
+            if raw_line.startswith("??") and self._is_generated_path(path):
                 continue
             dirty_paths.append(path)
 
@@ -256,6 +278,79 @@ class StepExecutor:
         if not lines:
             return ""
         return "## 이전 Step 산출물\n\n" + "\n".join(lines) + "\n\n"
+
+    @staticmethod
+    def _external_validation_command(command: str) -> bool:
+        normalized = str(command).strip().lower()
+        if not normalized:
+            return False
+        patterns = ("cmake ", "ctest ", "./build/", "build/")
+        return any(token in normalized for token in patterns)
+
+    def _validate_validation_scope(self, index: dict) -> Optional[str]:
+        scope = index.get("validation_scope", "framework")
+        if scope not in self.VALIDATION_SCOPES:
+            return f"validation_scope must be one of: {', '.join(self.VALIDATION_SCOPES)}"
+
+        if scope == "framework":
+            for step in index.get("steps", []):
+                commands = [str(cmd).strip() for cmd in step.get("validation_commands", []) if str(cmd).strip()]
+                offending = next((cmd for cmd in commands if self._external_validation_command(cmd)), None)
+                if offending:
+                    return f"framework validation_scope cannot run external target command: {offending}"
+            return None
+
+        target_root = index.get("target_root")
+        if not target_root:
+            return "external-target validation_scope requires top-level target_root"
+
+        target_path = Path(target_root)
+        if not target_path.is_absolute():
+            target_path = Path(self._root) / target_path
+        if not target_path.is_dir():
+            return f"external target root not found: {target_root}"
+        if not (target_path / "CMakeLists.txt").is_file():
+            return f"external target root does not contain CMakeLists.txt: {target_root}"
+        return None
+
+    def _tool_capabilities(self) -> dict:
+        python3_path = shutil.which("python3")
+        return {
+            "python3": bool(python3_path),
+            "pypdf": importlib.util.find_spec("pypdf") is not None,
+            "pdfplumber": importlib.util.find_spec("pdfplumber") is not None,
+            "pdfinfo": bool(shutil.which("pdfinfo")),
+            "pdftotext": bool(shutil.which("pdftotext")),
+            "pdftoppm": bool(shutil.which("pdftoppm")),
+        }
+
+    def _capability_summary(self, capabilities: dict) -> str:
+        ordered = ("python3", "pypdf", "pdfplumber", "pdfinfo", "pdftotext", "pdftoppm")
+        return ", ".join(f"{name}={'yes' if capabilities[name] else 'no'}" for name in ordered)
+
+    def _has_pdf_reference_step(self, index: dict) -> bool:
+        for step in index.get("steps", []):
+            contract = step.get("reference_contract") or {}
+            source_files = contract.get("source_files", [])
+            if any(str(path).lower().endswith(".pdf") for path in source_files):
+                return True
+        return False
+
+    def _validate_run_preflight(self):
+        index = self._read_json(self._index_file)
+        scope_error = self._validate_validation_scope(index)
+        if scope_error:
+            print(f"  ERROR: invalid validation scope: {scope_error}")
+            sys.exit(1)
+
+        scope = index.get("validation_scope", "framework")
+        self._log(f"validation scope: {scope}")
+        if scope == "external-target":
+            self._log(f"external target root: {index['target_root']}")
+
+        if self._has_pdf_reference_step(index):
+            capabilities = self._tool_capabilities()
+            self._log(f"pdf capability summary: {self._capability_summary(capabilities)}")
 
     @classmethod
     def _validate_step_schema(cls, step: dict) -> Optional[str]:
@@ -439,14 +534,16 @@ class StepExecutor:
             "3. 기존 테스트를 깨뜨리지 마라.\n"
             "4. AC(Acceptance Criteria) 검증을 직접 실행하라.\n"
             "5. 위험한 파괴적 명령이나 복구 불가능한 명령은 사용하지 마라.\n"
-            "6. `raw/` 아래 PDF 논문을 읽는 step이면 로컬 `pdf` 스킬을 사용하고, 필요한 식/표/파라미터/검증 기준을 `steps/artifacts/reference/` 아래 재사용 가능한 텍스트나 markdown으로 남겨라.\n"
-            "7. 이전 step에서 `steps/artifacts/reference/` 아래 reference artifact가 만들어졌다면, 후속 step은 해당 정보가 필요할 때 특별한 이유가 없는 한 `raw/` 원본보다 그 추출 산출물을 우선 읽어라.\n"
-            "8. target-project validation이 포함된 step은 `docs/RESULTS_POLICY.md`에 맞는 결과 산출물과 요약을 남기기 전에는 완료로 표시하지 마라.\n"
-            "9. 검증 결과와 최종 상태를 반영해 `/steps/index.json`을 직접 수정하라:\n"
+            "6. 가능하면 non-interactive one-shot command를 우선 사용하고, stdin이 필요한 장기 대화형 흐름은 피하라.\n"
+            "7. `raw/` 아래 PDF 논문을 읽는 step이면 로컬 `pdf` 스킬을 사용하라. 텍스트 추출은 Python 기반 추출(`pypdf`, `pdfplumber`)을 먼저 시도하고, Poppler CLI는 시각 검토가 필요할 때만 보조적으로 사용하라.\n"
+            "8. Poppler CLI가 없다고 바로 `blocked` 처리하지 마라. 먼저 Python 기반 추출 경로를 사용하라.\n"
+            "9. 이전 step에서 `steps/artifacts/reference/` 아래 reference artifact가 만들어졌다면, 후속 step은 해당 정보가 필요할 때 특별한 이유가 없는 한 `raw/` 원본보다 그 추출 산출물을 우선 읽어라.\n"
+            "10. target-project validation이 포함된 step은 `docs/RESULTS_POLICY.md`에 맞는 결과 산출물과 요약을 남기기 전에는 완료로 표시하지 마라.\n"
+            "11. 검증 결과와 최종 상태를 반영해 `/steps/index.json`을 직접 수정하라:\n"
             "   - AC 통과 -> \"completed\" + \"summary\" 필드에 이 step의 산출물을 한 줄로 요약\n"
             f"   - {self.MAX_RETRIES}회 수정 시도 후에도 실패 -> \"error\" + \"error_message\" 기록\n"
             "   - 사용자 개입이 필요한 경우 (API 키, 인증, 수동 설정 등) -> \"blocked\" + \"blocked_reason\" 기록 후 즉시 중단\n"
-            "10. 모든 변경사항을 커밋하라:\n"
+            "12. 모든 변경사항을 커밋하라:\n"
             f"   {commit_example}\n\n---\n\n"
         )
 
@@ -467,6 +564,35 @@ class StepExecutor:
                 if result.stderr:
                     print(f"  {result.stderr.strip()}")
                 sys.exit(1)
+
+    def _open_codex_stdin(self):
+        stdin_obj = getattr(sys, "stdin", None)
+        fileno = getattr(stdin_obj, "fileno", None)
+        if stdin_obj is not None and callable(fileno):
+            try:
+                if os.isatty(stdin_obj.fileno()):
+                    return stdin_obj, [], "parent-tty"
+            except (OSError, ValueError):
+                pass
+
+        master_fd, slave_fd = pty.openpty()
+        master_handle = os.fdopen(master_fd, "rb", buffering=0)
+        slave_handle = os.fdopen(slave_fd, "rb", buffering=0)
+        return slave_handle, [master_handle, slave_handle], "pty"
+
+    @staticmethod
+    def _read_text_tail(path: Path, limit: int = 2000) -> str:
+        if not path.exists():
+            return ""
+        text = path.read_text(encoding="utf-8", errors="replace")
+        return text[-limit:]
+
+    def _detect_stall_reason(self, stderr_text: str) -> Optional[str]:
+        lowered = stderr_text.lower()
+        for pattern in self.STALL_PATTERNS:
+            if pattern in lowered:
+                return pattern
+        return None
 
     def _invoke_codex(self, step: dict, preamble: str) -> dict:
         step_num, step_name = step["step"], step["name"]
@@ -508,71 +634,119 @@ class StepExecutor:
         proc = None
         forced_stop = False
         completed_with_timeout = False
+        timed_out = False
         stdout = ""
         stderr = ""
+        settled_logged = False
+        last_known_status = self._step_status(step_num)
+        failure_category = None
+        stall_reason = None
+        started_at = self._stamp()
+        ended_at = None
+        stdin_handle = None
+        cleanup_handles = []
+        stdin_mode = "devnull"
         try:
             with open(stdout_path, "w", encoding="utf-8") as stdout_file, open(stderr_path, "w", encoding="utf-8") as stderr_file:
+                stdin_handle, cleanup_handles, stdin_mode = self._open_codex_stdin()
                 proc = subprocess.Popen(
                     cmd,
                     cwd=self._root,
-                    stdin=subprocess.DEVNULL,
+                    stdin=stdin_handle,
                     stdout=stdout_file,
                     stderr=stderr_file,
                     text=True,
                 )
+                self._log(f"step {step_num}: Codex process started for '{step_name}' (stdin={stdin_mode})")
                 settled_at = None
                 deadline = time.monotonic() + self.EXEC_TIMEOUT
+                stderr_probe_tick = 0
 
                 while True:
                     ret = proc.poll()
                     status = self._step_status(step_num)
+                    last_known_status = status
                     if ret is not None:
                         exit_code = ret
                         break
 
-                    if status in {"completed", "error", "blocked"}:
-                        if settled_at is None:
-                            settled_at = time.monotonic()
-                        elif time.monotonic() - settled_at >= self.POST_STEP_GRACE:
+                    stderr_probe_tick += 1
+                    if status == "pending" and stderr_probe_tick % 5 == 0:
+                        stderr_tail = self._read_text_tail(stderr_path)
+                        stall_reason = self._detect_stall_reason(stderr_tail)
+                        if stall_reason:
                             forced_stop = True
+                            failure_category = "stall"
+                            self._log(f"step {step_num}: detected stalled Codex subprocess ({stall_reason})")
                             proc.terminate()
                             try:
                                 proc.communicate(timeout=self.TERMINATE_TIMEOUT)
                             except subprocess.TimeoutExpired:
                                 proc.kill()
                                 proc.communicate()
+                            exit_code = proc.returncode if proc.returncode is not None else 1
+                            break
+
+                    if status in {"completed", "error", "blocked"}:
+                        if settled_at is None:
+                            settled_at = time.monotonic()
+                            if not settled_logged:
+                                self._log(f"step {step_num}: status changed to '{status}', waiting for Codex process to settle")
+                                settled_logged = True
+                        elif time.monotonic() - settled_at >= self.POST_STEP_GRACE:
+                            forced_stop = True
+                            self._log(f"step {step_num}: terminating background Codex process after status '{status}'")
+                            proc.terminate()
+                            try:
+                                proc.communicate(timeout=self.TERMINATE_TIMEOUT)
+                            except subprocess.TimeoutExpired:
+                                self._log(f"step {step_num}: Codex process did not terminate cleanly; killing it")
+                                proc.kill()
+                                proc.communicate()
                             exit_code = proc.returncode if proc.returncode is not None else 0
                             break
                     else:
                         settled_at = None
+                        settled_logged = False
 
                     if time.monotonic() >= deadline:
                         if status in {"completed", "error", "blocked"}:
                             completed_with_timeout = True
                             forced_stop = True
+                            self._log(f"step {step_num}: timeout reached after final status '{status}', killing Codex process")
                             proc.kill()
                             proc.communicate()
                             exit_code = proc.returncode if proc.returncode is not None else 0
                             break
                         proc.kill()
                         proc.communicate()
-                        raise subprocess.TimeoutExpired(cmd=cmd, timeout=self.EXEC_TIMEOUT)
+                        timed_out = True
+                        exit_code = None
+                        break
 
                     time.sleep(0.2)
 
             stdout = stdout_path.read_text(encoding="utf-8") if stdout_path.exists() else ""
             stderr = stderr_path.read_text(encoding="utf-8") if stderr_path.exists() else ""
             last_message = last_message_path.read_text(encoding="utf-8") if last_message_path.exists() else ""
-        except subprocess.TimeoutExpired:
-            print(f"\n  WARN: Codex 실행이 {self.EXEC_TIMEOUT}초를 초과했습니다.")
-            raise
         finally:
             if proc and proc.poll() is None:
                 proc.kill()
                 proc.communicate()
+            for handle in cleanup_handles:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+            ended_at = self._stamp()
             last_message_path.unlink(missing_ok=True)
             stdout_path.unlink(missing_ok=True)
             stderr_path.unlink(missing_ok=True)
+
+        stderr_tail = stderr[-2000:]
+        if timed_out:
+            print(f"\n  WARN: Codex 실행이 {self.EXEC_TIMEOUT}초를 초과했습니다.")
+            failure_category = failure_category or "timeout"
 
         if exit_code != 0 and self._step_status(step_num) == "pending":
             print(f"\n  WARN: Codex가 비정상 종료됨 (code {exit_code})")
@@ -583,16 +757,27 @@ class StepExecutor:
         elif forced_stop:
             stderr = (stderr or "") + "\n[executor] step status finalized before Codex process exited; process was terminated by executor."
 
+        if failure_category is None and exit_code not in (None, 0) and last_known_status == "pending":
+            failure_category = "stall" if self._detect_stall_reason(stderr_tail) else "tooling"
+
         output = {
             "step": step_num,
             "name": step_name,
             "exitCode": exit_code,
             "stdout": stdout,
             "stderr": stderr,
+            "stderrTail": stderr_tail,
             "lastMessage": last_message,
             "forcedStop": forced_stop,
+            "startedAt": started_at,
+            "endedAt": ended_at,
+            "lastKnownStatus": last_known_status,
+            "failureCategory": failure_category,
+            "stdinMode": stdin_mode,
         }
         self._write_json(self._steps_dir / f"step{step_num}-output.json", output)
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=self.EXEC_TIMEOUT)
         return output
 
     def _record_commit_failure(self, step_num: int, message: str):
@@ -651,6 +836,10 @@ class StepExecutor:
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             index = self._read_json(self._index_file)
+            scope_error = self._validate_validation_scope(index)
+            if scope_error:
+                print(f"  ERROR: invalid validation scope: {scope_error}")
+                sys.exit(1)
             step_entry = next((item for item in index["steps"] if item["step"] == step_num), step)
             schema_error = self._validate_step_schema(step_entry)
             if schema_error:
@@ -667,6 +856,8 @@ class StepExecutor:
             if attempt > 1:
                 tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
 
+            self._log(f"step {step_num}: '{step_name}' starting (attempt {attempt}/{self.MAX_RETRIES})")
+            self._log(f"step {step_num}: running Codex executor")
             with progress_indicator(tag) as progress:
                 self._invoke_codex(step, preamble)
                 elapsed = int(progress.elapsed)
@@ -677,6 +868,7 @@ class StepExecutor:
             ts = self._stamp()
 
             if status == "completed":
+                self._log(f"step {step_num}: validating declared output contracts")
                 reference_error = self._validate_reference_contract(step_entry or step)
                 if reference_error:
                     for item in index["steps"]:
@@ -703,6 +895,7 @@ class StepExecutor:
                     print(f"    Error: {results_error}")
                     sys.exit(1)
 
+                self._log(f"step {step_num}: running post-step repo checks")
                 repo_checks = self._run_repo_checks()
                 if repo_checks and repo_checks.returncode != 0:
                     repo_msg = (repo_checks.stderr or repo_checks.stdout or "repo checks failed").strip()
@@ -721,7 +914,9 @@ class StepExecutor:
                     if item["step"] == step_num:
                         item["completed_at"] = ts
                 self._write_json(self._index_file, index)
+                self._log(f"step {step_num}: recording completion commit")
                 self._commit_step_or_fail(step_num, step_name)
+                self._log(f"step {step_num}: completed successfully")
                 print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
                 return True
 
@@ -731,6 +926,7 @@ class StepExecutor:
                         item["blocked_at"] = ts
                 self._write_json(self._index_file, index)
                 reason = next((item.get("blocked_reason", "") for item in index["steps"] if item["step"] == step_num), "")
+                self._log(f"step {step_num}: blocked - {reason or 'no reason recorded'}")
                 print(f"  ⏸ Step {step_num}: {step_name} blocked [{elapsed}s]")
                 print(f"    Reason: {reason}")
                 sys.exit(2)
@@ -764,6 +960,7 @@ class StepExecutor:
                         item.pop("error_message", None)
                 self._write_json(self._index_file, index)
                 prev_error = err_msg
+                self._log(f"step {step_num}: retry scheduled after failure - {err_msg}")
                 print(f"  ↻ Step {step_num}: retry {attempt}/{self.MAX_RETRIES} — {err_msg}")
             else:
                 for item in index["steps"]:
@@ -772,6 +969,7 @@ class StepExecutor:
                         item["error_message"] = f"[{self.MAX_RETRIES}회 시도 후 실패] {err_msg}"
                         item["failed_at"] = ts
                 self._write_json(self._index_file, index)
+                self._log(f"step {step_num}: exhausted retries, recording failure")
                 self._commit_step_or_fail(step_num, step_name)
                 print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_RETRIES} attempts [{elapsed}s]")
                 print(f"    Error: {err_msg}")
@@ -798,6 +996,7 @@ class StepExecutor:
         index = self._read_json(self._index_file)
         index["completed_at"] = self._stamp()
         self._write_json(self._index_file, index)
+        self._log(f"run completed at {index['completed_at']}")
 
         self._run_git("add", "-A")
         if self._run_git("diff", "--cached", "--quiet").returncode != 0:

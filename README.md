@@ -80,6 +80,7 @@ python3 scripts/execute.py --push
 - `steps/` 삭제만으로는 현재 세션 문맥이나 Git worktree 변경이 초기화되지 않는다.
 - 같은 Codex 세션에서는 이전에 읽은 step 내용이 대화 문맥에 남아 있을 수 있다.
 - 가장 깨끗한 재실행이 필요하면 새 step 계획 + 새 Codex 세션이 가장 안전하다.
+- 단, untracked `build/`, `results/`, `cmake-build-*` 같은 generated output은 dirty worktree 차단에서 제외된다.
 
 ## step 구조
 
@@ -94,6 +95,11 @@ steps/
 ## step 완료 조건
 
 - step 상태는 `steps/index.json`에서 관리한다.
+- `steps/index.json` 최상위에 `validation_scope`를 선언한다.
+- 허용되는 validation scope:
+  - `framework`
+  - `external-target`
+- `validation_scope`가 `external-target`이면 최상위에 `target_root`도 선언해야 한다.
 - 모든 step은 `type`을 선언해야 한다.
 - 허용되는 step type:
   - `reference`
@@ -114,14 +120,26 @@ steps/
   - `comparison_basis`
   - `validation_log_paths`
 
+scope별 규칙:
+
+- `framework`: framework self-check만 수행한다. `cmake`, `ctest`, `./build/...` 같은 external target 명령은 validation command로 넣지 않는다.
+- `external-target`: executor가 step 실행 전 `target_root`와 `CMakeLists.txt` 존재를 선검사한다.
+
 executor는 완료 직전 아래를 검사한다.
 
 - 실행될 Acceptance Criteria / validation command에 대한 위험 명령 preflight
 - circuit breaker
 - repo self-check
 - step type/schema 유효성
+- `validation_scope`와 repo capability의 일치 여부
 - `reference_contract`에 선언한 source/reference artifact와 required items 존재 여부
 - `results_contract`에 선언한 결과 파일, validation log, 요약 섹션, 실행 명령 증빙 존재 여부
+
+PDF reference step 기본 원칙:
+
+- 텍스트 추출은 `pypdf`, `pdfplumber` 같은 Python 경로를 먼저 시도한다.
+- Poppler CLI(`pdfinfo`, `pdftotext`, `pdftoppm`)는 있으면 사용하되 필수는 아니다.
+- Poppler가 없다는 이유만으로 reference step을 바로 `blocked` 처리하지 않는다.
 
 ## 참고
 
@@ -137,3 +155,10 @@ cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+논문 figure 비교 산출물은 가능하면 외부 Python plotting 패키지 없이도 재현 가능한 형식을 우선한다.
+
+- raw/sample data: `.csv`
+- 비교 요약: `.md`
+- overlay figure: `.svg`
+- `.png`는 선택적 산출물로 둔다.

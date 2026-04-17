@@ -8,6 +8,12 @@ tsconfig.tsbuildinfo
 steps/step*-output.json
 scripts/__pycache__/
 .codex/tmp/
+build/
+results/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
 
 # Terminal Paste Image folder
 .cp-images/

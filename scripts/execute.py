@@ -287,6 +287,55 @@ class StepExecutor:
         patterns = ("cmake ", "ctest ", "./build/", "build/")
         return any(token in normalized for token in patterns)
 
+    def _resolve_target_path(self, target_root: str) -> Path:
+        target_path = Path(target_root)
+        if not target_path.is_absolute():
+            target_path = Path(self._root) / target_path
+        return target_path
+
+    @staticmethod
+    def _has_src_tree(target_path: Path) -> bool:
+        return (target_path / "src").is_dir()
+
+    @staticmethod
+    def _next_pending_step(index: dict) -> Optional[dict]:
+        return next((step for step in index.get("steps", []) if step.get("status") == "pending"), None)
+
+    @staticmethod
+    def _has_later_pending_implementation_step(index: dict) -> bool:
+        seen_pending = False
+        for step in index.get("steps", []):
+            if step.get("status") != "pending":
+                continue
+            if not seen_pending:
+                seen_pending = True
+                continue
+            if step.get("type") == "implementation":
+                return True
+        return False
+
+    def _allow_external_target_bootstrap(self, index: dict, target_path: Path) -> bool:
+        if (target_path / "CMakeLists.txt").is_file():
+            return False
+        if not self._has_src_tree(target_path):
+            return False
+        next_step = self._next_pending_step(index)
+        return bool(next_step and next_step.get("type") == "implementation")
+
+    def _cmake_bootstrap_target(self, index: Optional[dict] = None) -> Optional[Path]:
+        current_index = index or self._read_json(self._index_file)
+        if current_index.get("validation_scope", "framework") != "external-target":
+            return None
+        target_root = current_index.get("target_root")
+        if not target_root:
+            return None
+        target_path = self._resolve_target_path(target_root)
+        if not self._has_src_tree(target_path):
+            return None
+        if (target_path / "CMakeLists.txt").is_file():
+            return None
+        return target_path
+
     def _validate_validation_scope(self, index: dict) -> Optional[str]:
         scope = index.get("validation_scope", "framework")
         if scope not in self.VALIDATION_SCOPES:
@@ -304,12 +353,23 @@ class StepExecutor:
         if not target_root:
             return "external-target validation_scope requires top-level target_root"
 
-        target_path = Path(target_root)
-        if not target_path.is_absolute():
-            target_path = Path(self._root) / target_path
+        target_path = self._resolve_target_path(target_root)
         if not target_path.is_dir():
             return f"external target root not found: {target_root}"
         if not (target_path / "CMakeLists.txt").is_file():
+            if self._allow_external_target_bootstrap(index, target_path):
+                return None
+            if self._has_src_tree(target_path):
+                next_step = self._next_pending_step(index)
+                if next_step and next_step.get("type") != "implementation" and self._has_later_pending_implementation_step(index):
+                    return (
+                        f"external target root has src/ but no CMakeLists.txt: {target_root} "
+                        "(next pending step must bootstrap CMakeLists.txt before validation)"
+                    )
+                return (
+                    f"external target root has src/ but no CMakeLists.txt: {target_root} "
+                    "(bootstrap step must create CMakeLists.txt before validation)"
+                )
             return f"external target root does not contain CMakeLists.txt: {target_root}"
         return None
 
@@ -336,6 +396,20 @@ class StepExecutor:
                 return True
         return False
 
+    def _bootstrap_guidance(self, index: Optional[dict] = None) -> Optional[str]:
+        target_path = self._cmake_bootstrap_target(index)
+        if target_path is None:
+            return None
+        rel_target = os.path.relpath(target_path, self._root)
+        rel_src = os.path.join(rel_target, "src") if rel_target != "." else "src"
+        rel_cmake = os.path.join(rel_target, "CMakeLists.txt") if rel_target != "." else "CMakeLists.txt"
+        location = "repo root" if rel_target == "." else f"`{rel_target}/` target root"
+        return (
+            f"- {location}에 `{rel_src}/`가 있고 `{rel_cmake}`가 없다면 `{rel_cmake}`를 먼저 생성하라.\n"
+            "- 이 경우 `framework` 분석만 하고 끝내지 마라. bootstrap 후 `cmake`, `ctest`, 가능한 대표 시뮬레이터 실행까지 이어질 수 있게 준비하라.\n"
+            "- 자동 생성 범위는 최소 `CMake` + `CTest` 기준이다. `tests/CMakeLists.txt`가 있으면 `enable_testing()`과 테스트 연결을 포함하라.\n"
+        )
+
     def _validate_run_preflight(self):
         index = self._read_json(self._index_file)
         scope_error = self._validate_validation_scope(index)
@@ -347,6 +421,8 @@ class StepExecutor:
         self._log(f"validation scope: {scope}")
         if scope == "external-target":
             self._log(f"external target root: {index['target_root']}")
+            if self._allow_external_target_bootstrap(index, self._resolve_target_path(index["target_root"])):
+                self._log("external target bootstrap required: src/ detected without CMakeLists.txt; implementation step must create it")
 
         if self._has_pdf_reference_step(index):
             capabilities = self._tool_capabilities()
@@ -522,6 +598,9 @@ class StepExecutor:
             if step.get("results_contract"):
                 outputs = "\n".join(f"- `{path}`" for path in step["results_contract"].get("output_paths", []))
                 step_requirements += f"- validation result output:\n{outputs}\n"
+            guidance = self._bootstrap_guidance()
+            if guidance and step_type != "validation":
+                step_requirements += guidance
             step_requirements += "\n---\n\n"
 
         return (

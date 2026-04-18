@@ -59,6 +59,7 @@
 - 모든 step은 `type`을 가져야 하며 허용값은 `reference`, `implementation`, `validation`이다.
 - `steps/index.json` 최상위에는 `validation_scope`를 둔다. 허용값은 `framework`, `external-target`이다.
 - `validation_scope`가 `external-target`이면 `steps/index.json` 최상위에 `target_root`를 선언해야 하며, 해당 경로는 실제 `CMakeLists.txt`를 포함한 target 프로젝트 루트여야 한다.
+- 단, repo root를 `target_root`로 쓰고 `src/` 폴더가 있는데 루트 `CMakeLists.txt`가 없다면, harness는 이를 framework-only 분석으로 축소하지 않는다. 먼저 루트 `CMakeLists.txt`를 생성하는 implementation step을 두고 이후 실제 external-target validation으로 이어가야 한다.
 
 ## 개발 프로세스
 - CRITICAL: 새 기능 구현 시 반드시 실패하는 테스트 또는 재현 가능한 검증부터 추가하고, 그 다음 구현을 수정한다.
@@ -70,9 +71,14 @@
 - 모든 step은 `steps/index.json`에서 `type`을 명시해야 한다. `reference`는 참고자료 추출, `implementation`은 코드 변경, `validation`은 빌드/테스트/케이스 실행/결과 비교를 담당한다.
 - `raw/`의 논문이나 참고 자료를 읽는 step은 `reference_contract`를 `steps/index.json` step 항목에 명시해야 한다. 최소 필드는 `source_files`, `output_paths`, `required_items`다.
 - `validation` step은 `validation_commands`를 `steps/index.json` step 항목에 명시해야 한다. 비어 있으면 안 되며, step은 이 명령들을 모두 직접 실행해야 한다.
+- repo root에 `src/`가 있는 external-target validation step의 최소 `validation_commands`는 `cmake -S . -B build`, `cmake --build build`, `ctest --test-dir build --output-on-failure`다. 실행 가능한 시뮬레이터와 케이스가 있으면 대표 실행 및 결과 비교 명령도 추가해야 한다.
 - `validation` step은 `results_contract`를 `steps/index.json` step 항목에 명시해야 한다. 최소 필드는 `summary_path`, `output_paths`, `comparison_artifacts`, `comparison_basis`, `validation_log_paths`다.
 - `validation_scope`가 `framework`이면 framework self-check 범위만 허용한다. 이때 `cmake`, `ctest`, `./build/...` 같은 external target 명령을 step validation command로 넣으면 안 된다.
 - `validation_scope`가 `external-target`이면 executor는 step 실행 전에 `target_root` 존재 여부와 `CMakeLists.txt` 존재 여부를 선검사한다. 성립하지 않으면 step 내부에서 오래 시도하지 않고 즉시 오류로 종료한다.
+- 단, repo root에 `src/`가 있고 루트 `CMakeLists.txt`가 없으며 pending implementation step이 남아 있으면, executor는 bootstrap window로 간주해 해당 implementation step이 루트 `CMakeLists.txt`를 만들 기회를 허용한다. validation 단계까지 갔는데도 `CMakeLists.txt`가 없으면 즉시 오류다.
+- repo root에 `src/`가 있으면 step 계획은 이를 external target 후보로 간주해야 한다. 기본값은 `validation_scope: "external-target"`, `target_root: "."` 이다.
+- repo root에 `src/`가 있고 루트 `CMakeLists.txt`가 없으면 implementation step이 최소 `CMake` + `CTest` 기준의 루트 `CMakeLists.txt`를 먼저 생성해야 한다. `tests/CMakeLists.txt`가 있으면 `enable_testing()`과 테스트 연결을 포함한다.
+- `src/`가 있는 프로젝트는 build 부재를 이유로 framework 분석만 하고 완료 처리하면 안 된다. 실행 가능한 타깃 또는 테스트 구성이 없으면 `completed` 대신 `blocked` 또는 `error`로 남겨야 한다.
 - `reference_contract`가 있는 step은 선언된 source 파일과 reference artifact가 실제로 존재해야 하고, `required_items`에 적은 핵심 항목이 추출 산출물에 포함돼야 완료로 간주한다.
 - target-project validation이 포함된 step은 `docs/RESULTS_POLICY.md`의 최소 산출물 계약을 충족해야 완료로 간주한다. 최소한 실행 명령, 실행 로그 위치, 출력 위치, 비교 기준, 비교 산출물, 요약 기록이 남아 있어야 하며, executor는 `results_contract`에 선언된 경로와 요약 파일 필수 섹션, validation command 실행 증빙을 검증한다.
 - `raw/`의 PDF를 읽는 reference step은 Poppler CLI 유무만으로 `blocked` 처리하지 않는다. 텍스트 추출은 `pypdf` 또는 `pdfplumber` 같은 Python 경로를 먼저 시도하고, Poppler는 시각 검토가 필요할 때만 보조적으로 사용한다.

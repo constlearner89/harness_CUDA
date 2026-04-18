@@ -173,6 +173,34 @@ class TestBuildPreamble:
     def test_includes_index_path(self, executor):
         assert "/steps/index.json" in executor._build_preamble("", "")
 
+    def test_includes_src_bootstrap_rules_when_cmake_missing(self, executor, tmp_project):
+        (tmp_project / "src").mkdir()
+        (tmp_project / "src" / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+        index = executor._read_json(executor._index_file)
+        index["validation_scope"] = "external-target"
+        index["target_root"] = "."
+        executor._write_json(executor._index_file, index)
+
+        result = executor._build_preamble("", "", step={"step": 2, "name": "bootstrap", "type": "implementation"})
+
+        assert "repo root에 `src/`가 있고 `CMakeLists.txt`가 없다면" in result
+        assert "`CMakeLists.txt`를 먼저 생성하라" in result
+        assert "`framework` 분석만 하고 끝내지 마라" in result
+
+    def test_uses_target_root_for_bootstrap_rules(self, executor, tmp_project):
+        target_root = tmp_project / "target"
+        (target_root / "src").mkdir(parents=True)
+        (target_root / "src" / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+        index = executor._read_json(executor._index_file)
+        index["validation_scope"] = "external-target"
+        index["target_root"] = "target"
+        executor._write_json(executor._index_file, index)
+
+        result = executor._build_preamble("", "", step={"step": 2, "name": "bootstrap", "type": "implementation"})
+
+        assert "`target/CMakeLists.txt`" in result
+        assert "`target/src/`" in result
+
 
 class TestCheckoutBranch:
     def _mock_git(self, executor, responses):
@@ -272,6 +300,73 @@ class TestValidationScope:
 
         error = executor._validate_validation_scope(index)
         assert "framework validation_scope" in error
+
+    def test_external_target_allows_src_bootstrap_before_validation(self, executor, tmp_project):
+        index = executor._read_json(executor._index_file)
+        index["validation_scope"] = "external-target"
+        index["target_root"] = "."
+        (tmp_project / "src").mkdir()
+        (tmp_project / "src" / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+        executor._write_json(executor._index_file, index)
+
+        assert executor._validate_validation_scope(index) is None
+
+    def test_external_target_rejects_validation_before_bootstrap_step(self, executor, tmp_project):
+        index = executor._read_json(executor._index_file)
+        index["validation_scope"] = "external-target"
+        index["target_root"] = "."
+        (tmp_project / "src").mkdir()
+        (tmp_project / "src" / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+        index["steps"] = [
+            {
+                "step": 0,
+                "name": "validate-first",
+                "type": "validation",
+                "status": "pending",
+                "validation_commands": ["cmake -S . -B build"],
+                "results_contract": {
+                    "summary_path": "results/case/summary.md",
+                    "output_paths": ["results/case/run.log"],
+                    "comparison_artifacts": ["results/case/comparison.md"],
+                    "comparison_basis": "baseline",
+                    "validation_log_paths": ["results/case/validation.log"],
+                },
+            },
+            {"step": 1, "name": "bootstrap-later", "type": "implementation", "status": "pending"},
+        ]
+        executor._write_json(executor._index_file, index)
+
+        error = executor._validate_validation_scope(index)
+        assert "next pending step must bootstrap CMakeLists.txt before validation" in error
+
+    def test_external_target_requires_cmake_after_bootstrap_window(self, executor, tmp_project):
+        index = executor._read_json(executor._index_file)
+        index["validation_scope"] = "external-target"
+        index["target_root"] = "."
+        (tmp_project / "src").mkdir()
+        (tmp_project / "src" / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+        for item in index["steps"]:
+            item["status"] = "completed"
+        index["steps"].append(
+            {
+                "step": 3,
+                "name": "validate",
+                "type": "validation",
+                "status": "pending",
+                "validation_commands": ["cmake -S . -B build", "ctest --test-dir build --output-on-failure"],
+                "results_contract": {
+                    "summary_path": "results/case/summary.md",
+                    "output_paths": ["results/case/run.log"],
+                    "comparison_artifacts": ["results/case/comparison.md"],
+                    "comparison_basis": "baseline",
+                    "validation_log_paths": ["results/case/validation.log"],
+                },
+            }
+        )
+        executor._write_json(executor._index_file, index)
+
+        error = executor._validate_validation_scope(index)
+        assert "bootstrap step must create CMakeLists.txt" in error
 
     def test_external_target_requires_existing_cmake_project(self, executor, tmp_project):
         index = executor._read_json(executor._index_file)

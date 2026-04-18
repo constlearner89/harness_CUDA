@@ -124,6 +124,9 @@ scope별 규칙:
 
 - `framework`: framework self-check만 수행한다. `cmake`, `ctest`, `./build/...` 같은 external target 명령은 validation command로 넣지 않는다.
 - `external-target`: executor가 step 실행 전 `target_root`와 `CMakeLists.txt` 존재를 선검사한다.
+- repo root에 `src/`가 있으면 기본값은 `validation_scope: "external-target"`, `target_root: "."` 이다.
+- repo root에 `src/`가 있고 루트 `CMakeLists.txt`가 없으면 harness는 framework-only 분석으로 축소하지 않는다. 먼저 루트 `CMakeLists.txt`를 생성하는 implementation step을 두고, 그 뒤 실제 `cmake`/`build`/`ctest` 검증으로 이어간다.
+- bootstrap window가 끝난 뒤에도 `CMakeLists.txt`가 없으면 step은 `completed`가 아니라 `blocked` 또는 `error`여야 한다.
 
 executor는 완료 직전 아래를 검사한다.
 
@@ -155,6 +158,8 @@ cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+`src/`가 있는 external-target validation step은 최소한 위 세 명령을 포함해야 한다. `tests/CMakeLists.txt`가 있으면 bootstrap된 루트 `CMakeLists.txt`는 `enable_testing()`과 테스트 연결을 포함해야 하고, 실행 가능한 시뮬레이터/케이스가 있으면 대표 실행과 결과 비교 명령도 추가한다.
 
 논문 figure 비교 산출물은 가능하면 외부 Python plotting 패키지 없이도 재현 가능한 형식을 우선한다.
 

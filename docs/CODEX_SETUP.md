@@ -84,9 +84,13 @@ trust_level = "trusted"
 - 모든 step은 `type`을 가져야 하며 허용값은 `reference`, `implementation`, `validation`이다.
 - `steps/index.json` 최상위에는 `validation_scope`를 둔다. 허용값은 `framework`, `external-target`이다.
 - `validation_scope`가 `external-target`이면 `target_root`도 선언해야 하며, executor는 step 실행 전에 해당 경로와 `CMakeLists.txt` 존재를 선검사한다.
+- repo root에 `src/`가 있으면 기본값은 `validation_scope: "external-target"`, `target_root: "."` 이다.
+- repo root에 `src/`가 있는데 루트 `CMakeLists.txt`가 없으면 harness는 framework-only 분석으로 끝내지 않는다. 먼저 루트 `CMakeLists.txt`를 만드는 implementation step을 수행한 뒤 실제 external-target validation으로 이어가야 한다.
 - `raw/`의 논문이나 참고 자료를 읽는 step은 `reference_contract`를 `steps/index.json`에 선언해야 하며, `scripts/execute.py`는 완료 직전 source 파일, reference artifact, required item 존재를 검증한다.
 - `validation` step은 `validation_commands`와 `results_contract`를 `steps/index.json`에 선언해야 하며, `results_contract`에는 `validation_log_paths`도 포함해야 한다. `scripts/execute.py`는 완료 직전 schema, 산출물 필수 항목, validation command 실행 증빙을 검증한다.
 - `validation_scope`가 `framework`이면 framework self-check만 수행한다. `cmake`, `ctest`, `./build/...` 같은 external target 명령은 validation command로 넣지 않는다.
+- repo root에 `src/`가 있는 external-target validation step의 최소 `validation_commands`는 `cmake -S . -B build`, `cmake --build build`, `ctest --test-dir build --output-on-failure`다.
+- bootstrap window가 끝난 뒤에도 `CMakeLists.txt`가 없거나 실행 가능한 타깃/테스트 구성이 없으면 `completed`가 아니라 `blocked` 또는 `error`로 남겨야 한다.
 - `raw/`에 PDF 논문이 있으면 해당 step은 로컬 `pdf` 스킬을 사용해 필요한 식, 표, 파라미터, 검증 기준을 읽고 `steps/artifacts/reference/` 아래에 추출 산출물을 남긴다.
 - PDF 텍스트 추출은 `pypdf`, `pdfplumber` 같은 Python 경로를 먼저 시도하고, Poppler CLI는 시각 검토가 필요할 때만 보조적으로 사용한다.
 - Poppler CLI가 없다는 이유만으로 reference step을 즉시 `blocked` 처리하지 않는다.

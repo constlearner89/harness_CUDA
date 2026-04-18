@@ -86,6 +86,8 @@ scripts/
 ## 빌드 및 검증 흐름
 - 빌드 시스템 기본값은 `CMake`다.
 - 자동 테스트 실행 기본값은 `CTest`다.
+- repo root에 `src/`가 있으면 하네스는 이를 external target 후보로 간주한다. 루트 `CMakeLists.txt`가 없더라도 framework-only 분석으로 축소하지 않고, 먼저 최소 `CMake` + `CTest` 기준의 루트 `CMakeLists.txt`를 생성하는 bootstrap step을 계획해야 한다.
+- bootstrap된 루트 `CMakeLists.txt`는 `src/`를 빌드 대상으로 포함하고, `tests/CMakeLists.txt`가 있으면 `enable_testing()`과 테스트 연결을 포함한다.
 - 검증은 단위 테스트 통과만으로 끝나지 않고, 대표 시뮬레이션 케이스 실행과 결과 비교를 포함해야 한다.
 - 결과 기록 형식과 비교 산출물은 `docs/RESULTS_POLICY.md`를 따른다.
 - 비교 기준이 여러 개일 때의 우선순위도 `docs/RESULTS_POLICY.md`를 따른다.
